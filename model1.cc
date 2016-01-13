@@ -41,6 +41,18 @@ bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
 
+int SampleFromDist(vector<float> dist){
+  unsigned w = 0;
+  double p = rand01();
+  for (; w < dist.size(); ++w) {
+    p -= dist[w];
+    if (p < 0.0) { break; }
+  }
+  // this should not really happen?
+  if (w == dist.size()) w = dist.size() - 1;
+  return w;
+}
+
 // returns embeddings of labels
 struct SymbolEmbedding {
   SymbolEmbedding(Model& m, unsigned n, unsigned dim) {
@@ -202,7 +214,7 @@ struct ModelOne {
     for(unsigned int t = 0; t < len; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
-      Expression h_rnn_last = tagrnn.back();
+      Expression h_rnn_last = use_dropout ? dropout(tagrnn.back(), dropout_rate) : tagrnn.back();
       // the factor -- c from the bi-rnn at this time step
       Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
@@ -215,7 +227,7 @@ struct ModelOne {
         for (int i = 0; i < dist.size(); ++i) {
           if (dist[i] > best) { best = dist[i]; besti = i; }
         }
-        assert(besti >= 0);
+        assert(besti != TAGSOS);
         y_decode.push_back(besti);
         // add to the tag rnn
         tagrnn.add_input(ye->embed(besti));
@@ -224,6 +236,55 @@ struct ModelOne {
       errs.push_back(i_err);
     }
     return sum(errs);
+  }
+
+  void Sample(const vector<int> x,
+              vector<int>& y_decode){
+    y_decode.clear();
+    ComputationGraph cg;
+    vector<Expression> xins = ConstructInput(x, cg);
+    int len = xins.size();
+
+    Expression i_thbias = parameter(cg, p_thbias);
+    Expression i_cth = parameter(cg, p_cth);
+    Expression i_h_rnn_lastth = parameter(cg, p_h_rnn_lastth);
+    Expression i_tbias = parameter(cg, p_tbias);
+    Expression i_th2t = parameter(cg, p_th2t);
+
+    Expression alpha = input(cg, 0.8f);
+
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), false, 0.0f);
+    
+    // Construct the forward rnn over y tags
+    tagrnn.new_graph(cg);  // reset RNN builder for new graph
+    tagrnn.disable_dropout();
+
+    tagrnn.start_new_sequence();
+    ye->new_graph(cg);
+    tagrnn.add_input(ye->embed(TAGSOS));
+
+    for(unsigned int t = 0; t < len; ++t){
+      // first compute the y tag at this step
+      // the factor -- last time h from forward tag rnn
+      Expression h_rnn_last = tagrnn.back();
+      // the factor -- c from the bi-rnn at this time step
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+      Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * alpha;
+
+      {
+        Expression res = softmax(i_t);
+        vector<float> dist = as_vector(cg.get_value(res.i));
+        unsigned sample_i = 0;
+        do {
+          sample_i = SampleFromDist(dist);
+        } while((int) sample_i == TOKENSOS || (int) sample_i == TOKENEOS);
+        y_decode.push_back((int)sample_i);
+        // add to the tag rnn
+        tagrnn.add_input(ye->embed(sample_i));
+      }
+    }
+    return;
+
   }
 };
 
@@ -283,16 +344,33 @@ void test_only(ModelOne<LSTMBuilder>& modelone,
     modelone.ComputeLoss(xins, sent.second, y_pred, cg, false);
     unsigned int i;
     for(i = 0; i < y_pred.size()-1; ++i){
-      auto pred = y_pred[i];
+      auto pred = modelone.td.Convert(y_pred[i]);
       cout << pred << " ";
     }
-    if(i >= 0 && (i == y_pred.size()-1)){
-      auto pred = y_pred[i];
-      cout << pred;
-    }
+    auto pred = modelone.td.Convert(y_pred[i]);
+    cout << pred;
     cout << endl;
   }
 }
+void sample_only(ModelOne<LSTMBuilder>& modelone,
+          vector<pair<vector<int>,vector<int>>>&test_set,
+          unsigned int sample_num){
+  for (auto& sent : test_set) {
+    for (unsigned int si = 0; si < sample_num; ++si){
+      vector<int> y_pred;
+      modelone.Sample(sent.first, y_pred);
+      unsigned int i;
+      for(i = 0; i < y_pred.size()-1; ++i){
+        auto pred = modelone.td.Convert(y_pred[i]);
+        cout << pred << " ";
+      }
+      auto pred = modelone.td.Convert(y_pred[i]);
+      cout << pred;
+      cout << endl;
+    }
+  }
+}
+
 
 void read_file(string file_path,
                      cnn::Dict& d,
@@ -400,6 +478,8 @@ int main(int argc, char** argv) {
       ("train", po::bool_switch()->default_value(false), "the training mode")
       ("load_original_model", po::bool_switch()->default_value(false), "continuing the training by loading the model, only valid during training")
       ("test", po::bool_switch()->default_value(false), "the test mode")
+      ("sample", po::bool_switch()->default_value(false), "the sample mode -- for each sentence, generate sample_num samples")
+      ("sample_num", po::value<unsigned int>()->default_value(100), "the number of samples for each sentence")
       ("dev_every_i_reports", po::value<unsigned>(&dev_every_i_reports)->default_value(1000))
       ("evaluate_test", po::bool_switch()->default_value(false), "evaluate test set every training iteration")
       ("train_file", po::value<string>(), "path of the train file")
@@ -538,7 +618,7 @@ int main(int argc, char** argv) {
       }
     }
     delete sgd;
-  }else if(vm["test"].as<bool>()){
+  }else{
     use_pretrained_embeding = false;
     Model model;
     cnn::Dict d;
@@ -548,8 +628,12 @@ int main(int argc, char** argv) {
     load_models(vm["model_file_prefix"].as<string>(), model);
     vector<pair<vector<int>,vector<int>>> test;
     read_file(vm["test_file"].as<string>(), d, td, test, true);
-    
-    test_only(modelone, test);
+
+    if(vm["test"].as<bool>()){
+      test_only(modelone, test);
+    }else if(vm["sample"].as<bool>()){
+      sample_only(modelone, test, vm["sample_num"].as<unsigned int>());
+    }
   }
 }
 

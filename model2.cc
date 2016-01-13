@@ -41,6 +41,18 @@ bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
 
+int SampleFromDist(vector<float> dist){
+  unsigned w = 0;
+  double p = rand01();
+  for (; w < dist.size(); ++w) {
+    p -= dist[w];
+    if (p < 0.0) { break; }
+  }
+  // this should not really happen?
+  if (w == dist.size()) w = dist.size() - 1;
+  return w;
+}
+
 // returns embeddings of labels
 struct SymbolEmbedding {
   SymbolEmbedding(Model& m, unsigned n, unsigned dim) {
@@ -239,15 +251,9 @@ struct ModelTwo {
       Expression ydist = softmax(u_t);
 
       unsigned w = 0;
+      auto dist = as_vector(cg.get_value(ydist.i));
       do {
-        auto dist = as_vector(cg.get_value(ydist.i));
-        double p = rand01();
-        for (; w < dist.size(); ++w) {
-          p -= dist[w];
-          if (p < 0.0) { break; }
-        }
-        // this should not really happen?
-        if (w == dist.size()) w = dist.size() - 1; 
+       w = SampleFromDist(dist);
       } while((int) w == TAGSOS);
 
       cur = w;
@@ -263,16 +269,10 @@ struct ModelTwo {
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
       Expression xdist = softmax(i_t);
+      auto dist = as_vector(cg.get_value(xdist.i));
       unsigned w = 0;
       do {
-        auto dist = as_vector(cg.get_value(xdist.i));
-        double p = rand01();
-        for (; w < dist.size(); ++w) {
-          p -= dist[w];
-          if (p < 0.0) { break; }
-        }
-        // this should not really happen?
-        if (w == dist.size()) w = dist.size() - 1; 
+        w = SampleFromDist(dist);
       } while((int) w == TOKENSOS || (int) w == TOKENEOS);
       gen_x.push_back(w);
     }
