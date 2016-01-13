@@ -214,7 +214,7 @@ struct ModelOne {
     for(unsigned int t = 0; t < len; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
-      Expression h_rnn_last = use_dropout ? dropout(tagrnn.back(), dropout_rate) : tagrnn.back();
+      Expression h_rnn_last = tagrnn.back();
       // the factor -- c from the bi-rnn at this time step
       Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});

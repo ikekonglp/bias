@@ -7,6 +7,7 @@
 #include "cnn/lstm.h"
 #include "cnn/dict.h"
 #include "cnn/expr.h"
+#include "cnn/cfsm-builder.h"
 
 #include <algorithm>
 #include <iostream>
@@ -20,7 +21,6 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/program_options.hpp>
-
 
 using namespace std;
 using namespace cnn;
@@ -37,9 +37,11 @@ unsigned XCRIBE_DIM = 128;
 unsigned TAG_RNN_HIDDEN_DIM = 32;
 unsigned TAG_DIM = 32;
 unsigned WORD_HIDDEN_DIM = 128;
+unsigned CLASS_HIDDEN_DIM = 128;
 bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
+ClassFactoredSoftmaxBuilder* cfsm = nullptr;
 
 int SampleFromDist(vector<float> dist){
   unsigned w = 0;
@@ -150,8 +152,8 @@ struct ModelTwo {
   Parameters* p_thbias;
   Parameters* p_yth;
 
-  Parameters* p_tbias;
-  Parameters* p_th2t;
+  // Parameters* p_tbias;
+  // Parameters* p_th2t;
 
   cnn::Dict d;
   cnn::Dict td;
@@ -170,8 +172,8 @@ struct ModelTwo {
     p_R = model.add_parameters({td.size(), TAG_RNN_HIDDEN_DIM});
     p_thbias = model.add_parameters({WORD_HIDDEN_DIM});
     p_yth = model.add_parameters({WORD_HIDDEN_DIM, TAG_RNN_HIDDEN_DIM});
-    p_tbias = model.add_parameters({d.size()});
-    p_th2t = model.add_parameters({d.size(), WORD_HIDDEN_DIM});
+    // p_tbias = model.add_parameters({d.size()});
+    // p_th2t = model.add_parameters({d.size(), WORD_HIDDEN_DIM});
 
   }
 
@@ -182,13 +184,16 @@ struct ModelTwo {
                             bool use_dropout,
                             float dropout_rate = 0) {
     int len = x.size();
+    assert(x.size() == y.size());
 
     Expression i_bias = parameter(cg , p_bias);
     Expression i_R = parameter(cg , p_R);
     Expression i_thbias = parameter(cg , p_thbias);
     Expression i_yth = parameter(cg , p_yth);
-    Expression i_tbias = parameter(cg , p_tbias);
-    Expression i_th2t = parameter(cg , p_th2t);
+    // Expression i_tbias = parameter(cg , p_tbias);
+    // Expression i_th2t = parameter(cg , p_th2t);
+
+    cfsm->new_graph(cg);
 
     vector<Expression> errs;
     // First we have an rnn generates y
@@ -216,9 +221,11 @@ struct ModelTwo {
     for(unsigned int t = 0; t < len; ++t){
       Expression y_t = ye->embed(y[t]);
       Expression i_th = tanh(affine_transform({i_thbias, i_yth, y_t}));
-      Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+      
+      // Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+      // Expression i_err = pickneglogsoftmax(i_t, x[t]);
 
-      Expression i_err = pickneglogsoftmax(i_t, x[t]);
+      Expression i_err = cfsm->neg_log_softmax(i_th, x[t]);
       errs.push_back(i_err);
     }
     return sum(errs);
@@ -235,8 +242,9 @@ struct ModelTwo {
     Expression i_R = parameter(cg , p_R);
     Expression i_thbias = parameter(cg , p_thbias);
     Expression i_yth = parameter(cg , p_yth);
-    Expression i_tbias = parameter(cg , p_tbias);
-    Expression i_th2t = parameter(cg , p_th2t);
+    // Expression i_tbias = parameter(cg , p_tbias);
+    // Expression i_th2t = parameter(cg , p_th2t);
+    cfsm->new_graph(cg);
     tagrnn.new_graph(cg);
     tagrnn.start_new_sequence();
     ye->new_graph(cg);
@@ -266,13 +274,13 @@ struct ModelTwo {
     for(unsigned int t = 0; t < gen_y.size(); ++t){
       Expression y_t = ye->embed(gen_y[t]);
       Expression i_th = tanh(affine_transform({i_thbias, i_yth, y_t}));
-      Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+      // Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
-      Expression xdist = softmax(i_t);
-      auto dist = as_vector(cg.get_value(xdist.i));
+      // Expression xdist = softmax(i_t);
+      // auto dist = as_vector(cg.get_value(xdist.i));
       unsigned w = 0;
       do {
-        w = SampleFromDist(dist);
+        w = cfsm->sample(i_th);
       } while((int) w == TOKENSOS || (int) w == TOKENEOS);
       gen_x.push_back(w);
     }
@@ -354,10 +362,10 @@ void test_only(ModelTwo<LSTMBuilder>& modeltwo,
 }
 
 void read_file(string file_path,
-                     cnn::Dict& d,
-                     cnn::Dict& td,
-                     vector<pair<vector<int>,vector<int>>>&read_set,
-                     bool test_only = false)
+               cnn::Dict& d,
+               cnn::Dict& td,
+               vector<pair<vector<int>,vector<int>>>&read_set,
+               bool test_only = false)
 {
   read_set.clear();
   string line;
@@ -370,6 +378,30 @@ void read_file(string file_path,
     }
   }
   cerr << "Reading data from " << file_path << " finished \n";
+}
+
+void read_reranking_file(string file_path,
+                         cnn::Dict& d, 
+                         cnn::Dict& td,
+                         vector<vector<int>>& reranking_set)
+{
+  reranking_set.clear();
+  string line;
+  cerr << "Reading reranking list from " << file_path << "...\n";
+  {
+    ifstream in(file_path);
+    assert(in);
+    while(getline(in, line)) {
+      vector <string> fields;
+      boost::algorithm::trim(line);
+      boost::algorithm::split(fields, line, boost::algorithm::is_any_of( " " ));
+      vector<int> tags;
+      for(string m : fields){
+        tags.push_back(td.Convert(m));
+      }
+      reranking_set.push_back(tags);
+    }
+  }
 }
 
 void save_models(string model_file_prefix,
@@ -432,42 +464,54 @@ void load_dicts(string model_file_prefix,
 
 double predict_and_evaluate(ModelTwo<LSTMBuilder>& modeltwo,
                             const vector<pair<vector<int>,vector<int>>>&input_set,
+                            const vector<vector<int>>& reranking_set,
+                            unsigned int sample_num,
                             string set_name = "DEV"
                             ){
-  for (int i = 0; i < 5; ++i){
-    modeltwo.RandomSample();
-  }
-  // vector<vector<int>> y_preds;
-  // vector<vector<int>> y_golds;
-  // for (auto& sent : input_set) {
-  //   ComputationGraph cg;
-  //   vector<int> y_pred;
-  //   vector<Expression> xins = modeltwo.ConstructInput(sent.first, cg);
-  //   modeltwo.ComputeLoss(xins, sent.second, y_pred, cg, false);
-  //   y_golds.push_back(sent.second);
-  //   y_preds.push_back(y_pred);
+  // for (int i = 0; i < 5; ++i){
+  //   modeltwo.RandomSample();
   // }
-  // double f = evaluate(y_preds, y_golds, modeltwo.d, modeltwo.td);
-  // cerr << set_name << endl;
-  // return f;
-  return 0;
+  vector<vector<int>> y_preds;
+  vector<vector<int>> y_golds;
+  for (unsigned int i = 0; i < input_set.size(); ++i){
+    auto sent = input_set[i];
+    y_golds.push_back(sent.second);
+    float min_loss = 9e99;
+    unsigned int best_ind = i * sample_num;
+    for (unsigned int j = i * sample_num; j < (i + 1) * sample_num; ++j){
+      ComputationGraph cg;
+      Expression loss = modeltwo.ComputeLoss(sent.first, reranking_set[j], cg, false);
+      float loss_d = as_scalar(cg.get_value(loss.i));
+      if (loss_d < min_loss){
+        min_loss = loss_d;
+        best_ind = j;
+      }
+    }
+    y_preds.push_back(reranking_set[best_ind]);
+  }
+  double f = evaluate(y_preds, y_golds, modeltwo.d, modeltwo.td);
+  cerr << set_name << endl;
+  return f;
 }
 
 
 int main(int argc, char** argv) {
   cnn::Initialize(argc, argv);
   unsigned dev_every_i_reports;
+  unsigned int sample_num;
   po::options_description desc("Allowed options");
   desc.add_options()
       ("help", "produce help message")
       ("train", po::bool_switch()->default_value(false), "the training mode")
+      ("clusters", po::value<string>(), "path to the word clusters")
       ("load_original_model", po::bool_switch()->default_value(false), "continuing the training by loading the model, only valid during training")
       ("test", po::bool_switch()->default_value(false), "the test mode")
       ("dev_every_i_reports", po::value<unsigned>(&dev_every_i_reports)->default_value(1000))
       ("evaluate_test", po::bool_switch()->default_value(false), "evaluate test set every training iteration")
       ("train_file", po::value<string>(), "path of the train file")
-      ("dev_file", po::value<string>(), "path of the dev file")
-      ("test_file", po::value<string>(), "path of the test file")
+      ("sample_num", po::value<unsigned int>(&sample_num)->default_value(100), "the number of samples we have when evaluating dev/test")
+      ("dev_file", po::value<string>(), "path of the dev file") // reranking of the dev file should be called dev.reranking
+      ("test_file", po::value<string>(), "path of the test file") // reranking of the test file should be called test.reranking
       ("model_file_prefix", po::value<string>(), "prefix path of the model files (and dictionaries)")
       ("upe", po::value<string>(), "use pre-trained word embeding")
       ("eta0", po::value<float>()->default_value(0.1f), "initial learning rate")
@@ -517,7 +561,11 @@ int main(int argc, char** argv) {
     int tgSOS = td.Convert("<s>");
     int tgEOS = td.Convert("</s>");
     assert(tgSOS == 0 && tgEOS == 1);
+
+    Model model;
+    cfsm = new ClassFactoredSoftmaxBuilder(CLASS_HIDDEN_DIM, vm["clusters"].as<string>(), &d, &model);
     vector<pair<vector<int>,vector<int>>> training, dev, test;
+    vector<vector<int>> dev_reranking, test_reranking;
     read_file(vm["train_file"].as<string>(), d, td, training);
 
     d.Freeze();  // no new word types allowed
@@ -525,8 +573,10 @@ int main(int argc, char** argv) {
     d.SetUnk("<UNK>"); // set UNK to allow the unseen character in the dev and test set
 
     read_file(vm["dev_file"].as<string>(), d, td, dev);
+    read_reranking_file(vm["dev_file"].as<string>() + ".reranking", d, td, dev_reranking);
     if (vm["evaluate_test"].as<bool>()){
       read_file(vm["test_file"].as<string>(), d, td, test);
+      read_reranking_file(vm["test_file"].as<string>() + ".reranking", d, td, test_reranking);
     }
     
     float eta_decay_rate = vm["eta_decay_onset_epoch"].as<unsigned>();
@@ -535,7 +585,7 @@ int main(int argc, char** argv) {
     cerr << "eta_decay_rate: " << eta_decay_rate << endl;
     cerr << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;
 
-    Model model;
+    
     // auto sgd = new SimpleSGDTrainer(&model);
     // auto sgd = new AdamTrainer(&model, 1e-6, 0.0005, 0.01, 0.9999, 1e-8);
     Trainer* sgd = new SimpleSGDTrainer(&model);
@@ -588,13 +638,13 @@ int main(int argc, char** argv) {
       cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") ";
       report++;
       if (report % dev_every_i_reports == 0) {
-        double f = predict_and_evaluate(modeltwo, dev);
+        double f = predict_and_evaluate(modeltwo, dev, dev_reranking, sample_num);
         if (f > f_best) {
           f_best = f;
           save_models(vm["model_file_prefix"].as<string>(), d, td, model);
-        }
-        if (vm["evaluate_test"].as<bool>()){
-          predict_and_evaluate(modeltwo, test, "TEST");
+          if (vm["evaluate_test"].as<bool>()){
+            predict_and_evaluate(modeltwo, test, test_reranking, sample_num, "TEST");
+          }
         }
       }
     }
@@ -605,10 +655,12 @@ int main(int argc, char** argv) {
     cnn::Dict d;
     cnn::Dict td;
     load_dicts(vm["model_file_prefix"].as<string>(), d, td);
+    cfsm = new ClassFactoredSoftmaxBuilder(CLASS_HIDDEN_DIM, vm["clusters"].as<string>(), &d, &model);
     ModelTwo<LSTMBuilder> modeltwo(model, d, td);
     load_models(vm["model_file_prefix"].as<string>(), model);
     vector<pair<vector<int>,vector<int>>> test;
     read_file(vm["test_file"].as<string>(), d, td, test, true);
+
     
     test_only(modeltwo, test);
   }
