@@ -32,11 +32,11 @@ const int TAGEOS = 1;
 namespace po = boost::program_options;
 
 unsigned LAYERS = 1;
-unsigned INPUT_DIM = 256; // originally 128
-unsigned XCRIBE_DIM = 256; // originally 128
-unsigned TAG_RNN_HIDDEN_DIM = 128; // originally 32
-unsigned TAG_DIM = 128; // originally 32
-unsigned TAG_HIDDEN_DIM = 256; // originally 128
+unsigned INPUT_DIM = 128;
+unsigned XCRIBE_DIM = 128;
+unsigned TAG_RNN_HIDDEN_DIM = 32;
+unsigned TAG_DIM = 32;
+unsigned TAG_HIDDEN_DIM = 128;
 bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
@@ -140,31 +140,24 @@ struct BiTrans {
 template <class Builder>
 struct ModelOne {
   SymbolEmbedding* xe;
-  SymbolEmbedding* ye;
   BiTrans<Builder> bt;
-  Builder tagrnn;
 
   Parameters* p_thbias;
   Parameters* p_cth;
-  Parameters* p_h_rnn_lastth;
   Parameters* p_tbias;
   Parameters* p_th2t;
 
   cnn::Dict d;
   cnn::Dict td;
   explicit ModelOne(Model& model, cnn::Dict& d_, cnn::Dict& td_) :
-      bt(model),
-      tagrnn(LAYERS, TAG_DIM, TAG_RNN_HIDDEN_DIM, &model){
+      bt(model){
     d = d_;
     td = td_;
     xe = new SymbolEmbedding(model, d.size(), INPUT_DIM);
     if (use_pretrained_embeding) {
        xe->load_embedding(d, pretrained_embeding);
     }
-    ye = new SymbolEmbedding(model, td.size(), TAG_DIM);
-
     p_cth = model.add_parameters({TAG_HIDDEN_DIM, XCRIBE_DIM});
-    p_h_rnn_lastth = model.add_parameters({TAG_HIDDEN_DIM, TAG_RNN_HIDDEN_DIM});
     p_thbias = model.add_parameters({TAG_HIDDEN_DIM});
     p_tbias = model.add_parameters({td.size()});
     p_th2t = model.add_parameters({td.size(), TAG_HIDDEN_DIM});
@@ -193,31 +186,18 @@ struct ModelOne {
 
     Expression i_thbias = parameter(cg, p_thbias);
     Expression i_cth = parameter(cg, p_cth);
-    Expression i_h_rnn_lastth = parameter(cg, p_h_rnn_lastth);
     Expression i_tbias = parameter(cg, p_tbias);
     Expression i_th2t = parameter(cg, p_th2t);
 
     vector<Expression> errs;
 
     vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), use_dropout, dropout_rate);
-    
-    // Construct the forward rnn over y tags
-    tagrnn.new_graph(cg);  // reset RNN builder for new graph
-    if(use_dropout){
-      tagrnn.set_dropout(dropout_rate);
-    }else{
-      tagrnn.disable_dropout();
-    }
-    tagrnn.start_new_sequence();
-    ye->new_graph(cg);
-    tagrnn.add_input(ye->embed(TAGSOS));
 
     for(unsigned int t = 0; t < len; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
-      Expression h_rnn_last = tagrnn.back();
       // the factor -- c from the bi-rnn at this time step
-      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t]}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
       // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
@@ -230,14 +210,6 @@ struct ModelOne {
         }
         assert(besti != TAGSOS);
         y_decode.push_back(besti);
-        // add to the tag rnn
-        if(training_mode){
-          // in the training mode, push the gold tag
-          tagrnn.add_input(ye->embed(y[t]));
-        }else{
-          // in the decoding mode, we can only push the predicted tag
-          tagrnn.add_input(ye->embed(besti));
-        }
       }
       Expression i_err = pickneglogsoftmax(i_t, y[t]);
       errs.push_back(i_err);
@@ -254,28 +226,15 @@ struct ModelOne {
 
     Expression i_thbias = parameter(cg, p_thbias);
     Expression i_cth = parameter(cg, p_cth);
-    Expression i_h_rnn_lastth = parameter(cg, p_h_rnn_lastth);
     Expression i_tbias = parameter(cg, p_tbias);
     Expression i_th2t = parameter(cg, p_th2t);
 
     Expression alpha = input(cg, 0.8f);
 
     vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), false, 0.0f);
-    
-    // Construct the forward rnn over y tags
-    tagrnn.new_graph(cg);  // reset RNN builder for new graph
-    tagrnn.disable_dropout();
-
-    tagrnn.start_new_sequence();
-    ye->new_graph(cg);
-    tagrnn.add_input(ye->embed(TAGSOS));
 
     for(unsigned int t = 0; t < len; ++t){
-      // first compute the y tag at this step
-      // the factor -- last time h from forward tag rnn
-      Expression h_rnn_last = tagrnn.back();
-      // the factor -- c from the bi-rnn at this time step
-      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t]}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * alpha;
 
       {
@@ -286,12 +245,9 @@ struct ModelOne {
           sample_i = SampleFromDist(dist);
         } while((int) sample_i == TOKENSOS || (int) sample_i == TOKENEOS);
         y_decode.push_back((int)sample_i);
-        // add to the tag rnn
-        tagrnn.add_input(ye->embed(sample_i));
       }
     }
     return;
-
   }
 };
 

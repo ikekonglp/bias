@@ -32,10 +32,8 @@ const int TAGEOS = 1;
 namespace po = boost::program_options;
 
 unsigned LAYERS = 1;
-unsigned INPUT_DIM = 128;
-unsigned XCRIBE_DIM = 128;
-unsigned TAG_RNN_HIDDEN_DIM = 32;
-unsigned TAG_DIM = 32;
+unsigned TAG_RNN_HIDDEN_DIM = 128;
+unsigned TAG_DIM = 128;
 unsigned WORD_HIDDEN_DIM = 128;
 unsigned CLASS_HIDDEN_DIM = 128;
 bool use_pretrained_embeding = false;
@@ -88,62 +86,8 @@ struct SymbolEmbedding {
 };
 
 template <class Builder>
-struct BiTrans {
-  Builder l2rbuilder;
-  Builder r2lbuilder;
-  Parameters* p_f2c;
-  Parameters* p_r2c;
-  Parameters* p_cb;
-
-  explicit BiTrans(Model& model) :
-      l2rbuilder(LAYERS, INPUT_DIM, XCRIBE_DIM, &model),
-      r2lbuilder(LAYERS, INPUT_DIM, XCRIBE_DIM, &model) {
-    p_f2c = model.add_parameters({XCRIBE_DIM, XCRIBE_DIM});
-    p_r2c = model.add_parameters({XCRIBE_DIM, XCRIBE_DIM});
-    p_cb = model.add_parameters({XCRIBE_DIM});
-  }
-
-  vector<Expression> transcribe(ComputationGraph& cg, const vector<Expression>& x, Expression start, Expression end, bool use_dropout, float dropout_rate = 0) {
-    l2rbuilder.new_graph(cg);
-    if(use_dropout){
-      l2rbuilder.set_dropout(dropout_rate);
-    }else{
-      l2rbuilder.disable_dropout();
-    }
-    l2rbuilder.start_new_sequence();
-    r2lbuilder.new_graph(cg);
-    if(use_dropout){
-      r2lbuilder.set_dropout(dropout_rate);
-    }else{
-      r2lbuilder.disable_dropout();
-    }
-    r2lbuilder.start_new_sequence();
-    Expression f2c = parameter(cg, p_f2c);
-    Expression r2c = parameter(cg, p_r2c);
-    Expression cb = parameter(cg, p_cb);
-
-    const int len = x.size();
-    vector<Expression> fwd(len), rev(len), res(len);
-
-    l2rbuilder.add_input(start);
-    for (int i = 0; i < len; ++i)
-      fwd[i] = l2rbuilder.add_input(x[i]);
-
-    r2lbuilder.add_input(end);
-    for (int i = len - 1; i >= 0; --i)
-      rev[i] = r2lbuilder.add_input(x[i]);
-
-    for (int i = 0; i < len; ++i)
-      res[i] = affine_transform({cb, f2c, fwd[i], r2c, rev[i]});
-    return res;
-  }
-};
-
-template <class Builder>
 struct ModelTwo {
-  SymbolEmbedding* xe;
   SymbolEmbedding* ye;
-  BiTrans<Builder> bt;
   Builder tagrnn;
 
   Parameters* p_bias;
@@ -158,14 +102,9 @@ struct ModelTwo {
   cnn::Dict d;
   cnn::Dict td;
   explicit ModelTwo(Model& model, cnn::Dict& d_, cnn::Dict& td_) :
-      bt(model),
       tagrnn(LAYERS, TAG_DIM, TAG_RNN_HIDDEN_DIM, &model){
     d = d_;
     td = td_;
-    xe = new SymbolEmbedding(model, d.size(), INPUT_DIM);
-    if (use_pretrained_embeding) {
-       xe->load_embedding(d, pretrained_embeding);
-    }
     ye = new SymbolEmbedding(model, td.size(), TAG_DIM);
     
     p_bias = model.add_parameters({td.size()});
