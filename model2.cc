@@ -154,6 +154,9 @@ struct ModelTwo {
       // Here we predict the tag next time
       Expression i_err = pickneglogsoftmax(u_t, t < len ? y[t] : TAGEOS);
       errs.push_back(i_err);
+      if (t < len){
+        tagrnn.add_input(ye->embed(y[t]));
+      }
     }
 
     // Second we generate independent emissions from the y

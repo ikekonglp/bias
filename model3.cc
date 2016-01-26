@@ -35,11 +35,14 @@
 namespace ip = boost::interprocess;
 //Define an STL compatible allocator of ints that allocates from the managed_shared_memory.
 //This allocator will allow placing containers in the segment
-typedef ip::allocator<int, ip::managed_shared_memory::segment_manager>  ShmemAllocator;
+typedef ip::allocator<int, ip::managed_shared_memory::segment_manager>  ShmemAllocatorInt;
 
 //Alias a vector that uses the previous STL-like allocator so that allocates
 //its values from the segment
-typedef ip::vector<int, ShmemAllocator> MyVector;
+typedef ip::vector<int, ShmemAllocatorInt> MyVectorInt;
+
+typedef ip::allocator<float, ip::managed_shared_memory::segment_manager>  ShmemAllocatorFloat;
+typedef ip::vector<float, ShmemAllocatorFloat> MyVectorFloat;
 
 
 
@@ -125,7 +128,7 @@ struct BiTrans {
     p_cb = model.add_parameters({XCRIBE_DIM});
   }
 
-  vector<Expression> transcribe(ComputationGraph& cg, const vector<Expression>& x, Expression start, Expression end, bool use_dropout, float dropout_rate = 0) {
+  vector<Expression> transcribe(ComputationGraph& cg, const vector<Expression>& x, Expression start, Expression end, Expression& start_c, Expression& end_c, bool use_dropout, float dropout_rate = 0) {
     l2rbuilder.new_graph(cg);
     if(use_dropout){
       l2rbuilder.set_dropout(dropout_rate);
@@ -147,16 +150,22 @@ struct BiTrans {
     const int len = x.size();
     vector<Expression> fwd(len), rev(len), res(len);
 
-    l2rbuilder.add_input(start);
+    Expression l2r_start = l2rbuilder.add_input(start);
     for (int i = 0; i < len; ++i)
       fwd[i] = l2rbuilder.add_input(x[i]);
+    Expression l2r_end = l2rbuilder.add_input(end);
 
-    r2lbuilder.add_input(end);
+    Expression r2l_start = r2lbuilder.add_input(end);
     for (int i = len - 1; i >= 0; --i)
       rev[i] = r2lbuilder.add_input(x[i]);
+    Expression r2l_end = r2lbuilder.add_input(start);
 
     for (int i = 0; i < len; ++i)
       res[i] = affine_transform({cb, f2c, fwd[i], r2c, rev[i]});
+
+    start_c = affine_transform({cb, f2c, l2r_start, r2c, r2l_end});\
+    end_c = affine_transform({cb, f2c, l2r_end, r2c, r2l_start});
+
     return res;
   }
 };
@@ -221,8 +230,8 @@ struct ModelThree {
     Expression i_th2t = parameter(cg, p_th2t);
 
     vector<Expression> errs;
-
-    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), use_dropout, dropout_rate);
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, use_dropout, dropout_rate);
     
     // Construct the forward rnn over y tags
     tagrnn.new_graph(cg);  // reset RNN builder for new graph
@@ -235,16 +244,18 @@ struct ModelThree {
     ye->new_graph(cg);
     tagrnn.add_input(ye->embed(TAGSOS));
 
-    for(unsigned int t = 0; t < len; ++t){
+    for(unsigned int t = 0; t < len+1; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
       Expression h_rnn_last = tagrnn.back();
       // the factor -- c from the bi-rnn at this time step
-      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
+      Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
+      errs.push_back(i_err);
       // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
-      {
+      if(t < len){
         vector<float> dist = as_vector(cg.get_value(i_t.i));
         double best = -9e99;
         int besti = -1;
@@ -262,8 +273,6 @@ struct ModelThree {
           tagrnn.add_input(ye->embed(besti));
         }
       }
-      Expression i_err = pickneglogsoftmax(i_t, y[t]);
-      errs.push_back(i_err);
     }
     return sum(errs);
   }
@@ -283,7 +292,8 @@ struct ModelThree {
     Expression i_tbias = parameter(cg, p_tbias);
     Expression i_th2t = parameter(cg, p_th2t);
 
-    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), use_dropout, dropout_rate);
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, use_dropout, dropout_rate);
     
     // Construct the forward rnn over y tags
     tagrnn.new_graph(cg);  // reset RNN builder for new graph
@@ -304,13 +314,15 @@ struct ModelThree {
       vector<Expression> szx;
       tagrnn.start_new_sequence();
       tagrnn.add_input(ye->embed(TAGSOS));
-      for(unsigned int t = 0; t < len; ++t){
+      for(unsigned int t = 0; t < len+1; ++t){
         Expression h_rnn_last = tagrnn.back();
         // the factor -- c from the bi-rnn at this time step
-        Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+        Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
         Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
-        tagrnn.add_input(ye->embed(sample[t]));
-        Expression i_err = pickneglogsoftmax(i_t, sample[t]);
+        if(t < len){
+          tagrnn.add_input(ye->embed(sample[t]));
+        }
+        Expression i_err = pickneglogsoftmax(i_t, t < len ? sample[t] : TAGEOS);
         szx.push_back(i_err);
       }
       zx_elements.push_back(sum(szx) * alpha);
@@ -322,13 +334,15 @@ struct ModelThree {
       vector<Expression> szx;
       tagrnn.start_new_sequence();
       tagrnn.add_input(ye->embed(TAGSOS));
-      for(unsigned int t = 0; t < len; ++t){
+      for(unsigned int t = 0; t < len+1; ++t){
         Expression h_rnn_last = tagrnn.back();
         // the factor -- c from the bi-rnn at this time step
-        Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+        Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
         Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
-        tagrnn.add_input(ye->embed(y[t]));
-        Expression i_err = pickneglogsoftmax(i_t, y[t]);
+        if(t < len){
+          tagrnn.add_input(ye->embed(y[t]));
+        }
+        Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
         szx.push_back(i_err);
       }
       score_xy = sum(szx) * alpha;
@@ -352,7 +366,8 @@ struct ModelThree {
 
     vector<Expression> errs;
 
-    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), false, 0.0f);
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, false, 0);
     
     // Construct the forward rnn over y tags
     tagrnn.new_graph(cg);  // reset RNN builder for new graph
@@ -361,28 +376,28 @@ struct ModelThree {
     ye->new_graph(cg);
     tagrnn.add_input(ye->embed(TAGSOS));
 
-    for(unsigned int t = 0; t < len; ++t){
+    for(unsigned int t = 0; t < len+1; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
       Expression h_rnn_last = tagrnn.back();
       // the factor -- c from the bi-rnn at this time step
-      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
       // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
-      {
+      if(t < len){
         vector<float> dist = as_vector(cg.get_value(i_t.i));
         double best = -9e99;
         int besti = -1;
         for (int i = 0; i < dist.size(); ++i) {
           if (dist[i] > best) { best = dist[i]; besti = i; }
         }
-        assert(besti != TAGSOS);
+        // assert(besti != TAGSOS);
         y_decode.push_back(besti);
         // in the decoding mode, we can only push the predicted tag
         tagrnn.add_input(ye->embed(besti));
       }
-      Expression i_err = pickneglogsoftmax(i_t, y[t]);
+      Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
       errs.push_back(i_err);
     }
     return sum(errs);
@@ -407,7 +422,8 @@ struct ModelThree {
     // Expression annel = input(cg, 0.8f);
     Expression annel = input(cg, annel_value);
 
-    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), use_dropout, dropout_rate);
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, false, 0);
     
     // Construct the forward rnn over y tags
     tagrnn.new_graph(cg);  // reset RNN builder for new graph
@@ -421,15 +437,14 @@ struct ModelThree {
     ye->new_graph(cg);
     tagrnn.add_input(ye->embed(TAGSOS));
 
-    for(unsigned int t = 0; t < len; ++t){
+    for(unsigned int t = 0; t < len+1; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
       Expression h_rnn_last = tagrnn.back();
       // the factor -- c from the bi-rnn at this time step
-      Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * annel;
-
-      {
+      if(t < len){
         Expression res = softmax(i_t);
         vector<float> dist = as_vector(cg.get_value(res.i));
         unsigned sample_i = 0;
@@ -445,12 +460,14 @@ struct ModelThree {
 
   }
 
-  void SampleParallel(const vector<int> x,
-              vector<vector<int>>& y_samples,
-              int sample_num,
-              float annel_value = 1.0f,
-              bool use_dropout = false,
-              float dropout_rate = 0){
+void SampleParallel(const vector<int> x,
+                      vector<vector<int>>& y_samples,
+                      vector<float>& y_scores,
+                      int sample_num,
+                      string model_file_prefix,
+                      float annel_value = 1.0f,
+                      bool use_dropout = false,
+                      float dropout_rate = 0){
     ComputationGraph cg;
     vector<Expression> xins = ConstructInput(x, cg);
     int len = xins.size();
@@ -461,29 +478,37 @@ struct ModelThree {
     Expression i_tbias = parameter(cg, p_tbias);
     Expression i_th2t = parameter(cg, p_th2t);
 
-    // Expression annel = input(cg, 0.8f);
+    // Expression alpha = input(cg, annel_value);
     Expression annel = input(cg, annel_value);
-
-    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), use_dropout, dropout_rate);
-    string sufix = to_string(time(0)) + to_string(rand());
-    string mem_name = "MySharedMemory_" + sufix;
-    string vector_name = "MyVector_" + sufix;
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, use_dropout, dropout_rate);
+    string sufix = model_file_prefix + "_" +to_string(time(0)) + to_string(rand());
+    string mem_name_int = "MySharedMemoryInt_" + sufix;
+    string vector_name_int = "MyVectorInt_" + sufix;
+    string mem_name_float = "MySharedMemoryFloat_" + sufix;
+    string vector_name_float = "MyVectorFloat_" + sufix;
 
     assert (cnn::ps->is_shared());
 
-    ip::message_queue::remove(mem_name.c_str());
+    ip::message_queue::remove(mem_name_int.c_str());
+    ip::message_queue::remove(mem_name_float.c_str());
 
     //Create a new segment with given name and size
-    ip::managed_shared_memory segment(ip::create_only, mem_name.c_str(), 2 * sizeof(int) * len * sample_num);
-
+    ip::managed_shared_memory segment_int(ip::create_only, mem_name_int.c_str(), 2 * sizeof(int) * len * sample_num);
+    ip::managed_shared_memory segment_float(ip::create_only, mem_name_float.c_str(), 2 * sizeof(float) * sample_num);
     //Initialize shared memory STL-compatible allocator
-    const ShmemAllocator alloc_inst (segment.get_segment_manager());
+    const ShmemAllocatorInt alloc_inst_int (segment_int.get_segment_manager());
+    const ShmemAllocatorFloat alloc_inst_float (segment_float.get_segment_manager());
 
-    //Construct a vector named vector_name in shared memory with argument alloc_inst
-    MyVector *myvector = segment.construct<MyVector>(vector_name.c_str())(alloc_inst);
+    //Construct a vector named vector_name_int in shared memory with argument alloc_inst_int
+    MyVectorInt *myvector_int = segment_int.construct<MyVectorInt>(vector_name_int.c_str())(alloc_inst_int);
+    MyVectorFloat *myvector_float = segment_float.construct<MyVectorFloat>(vector_name_float.c_str())(alloc_inst_float);
 
     for(int i = 0; i < sample_num * len; ++i){
-       myvector->push_back(0);
+       myvector_int->push_back(0);
+    }
+    for(int i = 0; i < sample_num; ++i){
+       myvector_float->push_back(9e99);
     }
 
     vector<pid_t> cp_ids; 
@@ -497,10 +522,12 @@ struct ModelThree {
         abort();
       }
       else if (pid == 0) {
-        ip::managed_shared_memory segment_in_child(ip::open_only, mem_name.c_str());  
+        ip::managed_shared_memory segment_in_child_int(ip::open_only, mem_name_int.c_str());
+        ip::managed_shared_memory segment_in_child_float(ip::open_only, mem_name_float.c_str());
 
         //Find the vector using the c-string name
-        MyVector *myvector_in_child = segment_in_child.find<MyVector>(vector_name.c_str()).first;
+        MyVectorInt *myvector_int_in_child = segment_in_child_int.find<MyVectorInt>(vector_name_int.c_str()).first;
+        MyVectorFloat *myvector_float_in_child = segment_in_child_float.find<MyVectorFloat>(vector_name_float.c_str()).first;
 
         //child
         tagrnn.new_graph(cg);  // reset RNN builder for new graph
@@ -513,25 +540,34 @@ struct ModelThree {
         ye->new_graph(cg);
         tagrnn.add_input(ye->embed(TAGSOS));
 
-        for(unsigned int t = 0; t < len; ++t){
+        vector<Expression> errs;
+
+        for(unsigned int t = 0; t < len+1; ++t){
           // first compute the y tag at this step
           // the factor -- last time h from forward tag rnn
           Expression h_rnn_last = tagrnn.back();
           // the factor -- c from the bi-rnn at this time step
-          Expression i_th = tanh(affine_transform({i_thbias, i_cth, c[t], i_h_rnn_lastth, h_rnn_last}));
+          Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
           Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * annel;
-          {
+          unsigned sample_i = 0;
+          if(t < len){
             Expression res = softmax(i_t);
             vector<float> dist = as_vector(cg.get_value(res.i));
-            unsigned sample_i = 0;
             do {
               sample_i = SampleFromDist(dist);
-            } while((int) sample_i == TOKENSOS || (int) sample_i == TOKENEOS);
-            (*myvector_in_child)[cid * len + t] = (int)sample_i;
+            } while((int) sample_i == TAGSOS || (int) sample_i == TAGEOS);
+            (*myvector_int_in_child)[cid * len + t] = (int)sample_i;
             // add to the tag rnn
             tagrnn.add_input(ye->embed(sample_i));
           }
+
+          Expression i_err = pickneglogsoftmax(i_t, t < len ? sample_i : TAGEOS);
+          errs.push_back(i_err);
         }
+
+        Expression error = sum(errs);
+        float v_e = as_scalar(cg.get_value(error.i));
+        (*myvector_float_in_child)[cid] = v_e;
         exit(0);
       }else if (pid > 0){
           cp_ids.push_back(pid);
@@ -544,14 +580,18 @@ struct ModelThree {
     }
 
    // for (int i = 0; i < sample_num * len; ++i){
-   //  cerr << "parent " << "i = " << (*myvector)[i]  << endl;
+   //  cerr << "parent " << "i = " << (*myvector_int)[i]  << endl;
    // }
    for (unsigned int i = 0; i < sample_num; ++i){
     for (unsigned int j = 0; j < len; ++j){
-      y_samples[i].push_back((*myvector)[i * len + j]);
+      y_samples[i].push_back((*myvector_int)[i * len + j]);
     }
    }
-   ip::message_queue::remove(mem_name.c_str());
+   for (unsigned int i = 0; i < sample_num; ++i){
+    y_scores.push_back((*myvector_float)[i]);
+   }
+   ip::message_queue::remove(mem_name_int.c_str());
+   ip::message_queue::remove(mem_name_float.c_str());
    return;
   }
 };
@@ -721,17 +761,28 @@ void load_dicts(string model_file_prefix,
 
 double predict_and_evaluate(ModelThree<LSTMBuilder>& modelthree,
                             const vector<pair<vector<int>,vector<int>>>&input_set,
+                            int sample_num,
+                            string model_file_prefix,
+                            float annel_value,
                             string set_name = "DEV"
                             ){
   vector<vector<int>> y_preds;
   vector<vector<int>> y_golds;
   for (auto& sent : input_set) {
-    ComputationGraph cg;
-    vector<int> y_pred;
-    vector<Expression> xins = modelthree.ConstructInput(sent.first, cg);
-    modelthree.Decode(xins, sent.second, y_pred, cg);
+    vector<float> y_scores;
+    vector<vector<int>> y_samples(sample_num);
+    modelthree.SampleParallel(sent.first, y_samples, y_scores, sample_num, model_file_prefix, annel_value, false, 0);
+    assert(y_samples.size() == y_scores.size());
+    float min_v = 9e99;
+    unsigned int min_i = 0;
+    for(unsigned int i = 0; i < y_scores.size(); ++i){
+      if(y_scores[i] < min_v){
+        min_v = y_scores[i];
+        min_i = i;
+      }
+    }
     y_golds.push_back(sent.second);
-    y_preds.push_back(y_pred);
+    y_preds.push_back(y_samples[min_i]);
   }
   double f = evaluate(y_preds, y_golds, modelthree.d, modelthree.td);
   cerr << set_name << endl;
@@ -742,6 +793,7 @@ double predict_and_evaluate(ModelThree<LSTMBuilder>& modelthree,
 int main(int argc, char** argv) {
   cnn::Initialize(argc, argv, 1, true);
   unsigned dev_every_i_reports;
+  float annel_value;
   po::options_description desc("Allowed options");
   desc.add_options()
       ("help", "produce help message")
@@ -763,6 +815,7 @@ int main(int argc, char** argv) {
       ("eta_decay_onset_epoch", po::value<unsigned>()->default_value(8), "start decaying eta every epoch after this epoch (try 8)")
       ("eta_decay_rate", po::value<float>()->default_value(0.5f), "how much to decay eta by (recommended 0.5)")
       ("dropout_rate", po::value<float>(), "dropout rate, also indicts using dropout during training")
+      ("annel_value", po::value<float>(&annel_value)->default_value(0.8f), "annel value when sampling")
   ;
 
   po::variables_map vm;
@@ -884,11 +937,13 @@ int main(int argc, char** argv) {
           // cerr << "crf " << endl;
           unsigned int sample_num = vm["sample_num"].as<unsigned int>();
           vector<vector<int>> y_samples_v(sample_num);
+          vector<float> y_scores;
           // #pragma omp parallel for num_threads(20)
           // for (unsigned int sample_ind = 0; sample_ind < sample_num; sample_ind++){
           //   modelthree.Sample(sent.first, y_samples_v[sample_ind], 1.0f, use_dropout, dropout_rate);
           // }
-          modelthree.SampleParallel(sent.first, y_samples_v, sample_num, 1.0f, use_dropout, dropout_rate);
+          // modelthree.SampleParallel(sent.first, y_samples_v, sample_num, 1.0f, use_dropout, dropout_rate);
+          modelthree.SampleParallel(sent.first, y_samples_v, y_scores, sample_num, vm["model_file_prefix"].as<string>(), annel_value, false, 0);
 
           set<vector<int>> y_samples;
           for(unsigned int sample_ind = 0; sample_ind < sample_num; sample_ind++){
@@ -911,13 +966,13 @@ int main(int argc, char** argv) {
       cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") ";
       report++;
       if (report % dev_every_i_reports == 0) {
-        double f = predict_and_evaluate(modelthree, dev);
+        double f = predict_and_evaluate(modelthree, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
         if (f > f_best) {
           f_best = f;
           save_models(vm["model_file_prefix"].as<string>(), d, td, model);
         }
         if (vm["evaluate_test"].as<bool>()){
-          predict_and_evaluate(modelthree, test, "TEST");
+          predict_and_evaluate(modelthree, test, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value, "TEST");
         }
       }
     }
