@@ -17,6 +17,7 @@
 #include <omp.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <math.h>
 
 #include <boost/archive/text_iarchive.hpp>
 #include <boost/archive/text_oarchive.hpp>
@@ -62,6 +63,7 @@ unsigned TAG_HIDDEN_DIM = 256; // originally 128
 bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
+int bias_mode = 0;
 
 ofstream logfile;
 
@@ -79,7 +81,11 @@ int SampleFromDist(vector<float> dist){
 
 // returns embeddings of labels
 struct SymbolEmbedding {
-  SymbolEmbedding(Model& m, unsigned n, unsigned dim) {
+  unsigned dim;
+  bool zero_out;
+  SymbolEmbedding(Model& m, unsigned n, unsigned dim_, bool zero_out_ = false) {
+    dim = dim_;
+    zero_out = zero_out_;
     p_labels = m.add_lookup_parameters(n, {dim});
   }
   void load_embedding(cnn::Dict& d, string pretrain_path){
@@ -103,7 +109,12 @@ struct SymbolEmbedding {
   }
   void new_graph(ComputationGraph& g) { cg = &g; }
   Expression embed(unsigned label_id) {
-    return lookup(*cg, p_labels, label_id);
+    if (zero_out){
+      vector<float> data(dim, 0.0f);
+      return input(*cg, {dim}, data);
+    }else{
+      return lookup(*cg, p_labels, label_id);
+    }
   }
   ComputationGraph* cg;
   LookupParameters* p_labels;
@@ -116,6 +127,7 @@ struct BiTrans {
   Parameters* p_f2c;
   Parameters* p_r2c;
   Parameters* p_cb;
+
 
   explicit BiTrans(Model& model) :
       l2rbuilder(LAYERS, INPUT_DIM, XCRIBE_DIM, &model),
@@ -157,11 +169,27 @@ struct BiTrans {
       rev[i] = r2lbuilder.add_input(x[i]);
     Expression r2l_end = r2lbuilder.add_input(start);
 
-    for (int i = 0; i < len; ++i)
-      res[i] = affine_transform({cb, f2c, fwd[i], r2c, rev[i]});
+    for (int i = 0; i < len; ++i){
+      if(bias_mode == 0 || bias_mode == 3){
+        res[i] = affine_transform({cb, f2c, fwd[i], r2c, rev[i]});
+      }else if (bias_mode == 1){
+        // biased to the left, so no r to l information
+        res[i] = affine_transform({cb, f2c, fwd[i]});
+      }else if (bias_mode == 2){
+        res[i] = affine_transform({cb, r2c, rev[i]});
+      }
+    }
 
-    start_c = affine_transform({cb, f2c, l2r_start, r2c, r2l_end});\
-    end_c = affine_transform({cb, f2c, l2r_end, r2c, r2l_start});
+    if (bias_mode == 0 || bias_mode == 3){
+      start_c = affine_transform({cb, f2c, l2r_start, r2c, r2l_end});
+      end_c = affine_transform({cb, f2c, l2r_end, r2c, r2l_start});
+    }else if(bias_mode == 1){
+      start_c = affine_transform({cb, f2c, l2r_start});
+      end_c = affine_transform({cb, f2c, l2r_end});
+    }else if(bias_mode == 2){
+      start_c = affine_transform({cb, r2c, r2l_end});
+      end_c = affine_transform({cb, r2c, r2l_start});
+    }
 
     return res;
   }
@@ -191,7 +219,12 @@ struct ModelOne {
     if (use_pretrained_embeding) {
        xe->load_embedding(d, pretrained_embeding);
     }
-    ye = new SymbolEmbedding(model, td.size(), TAG_DIM);
+    if (bias_mode == 0 || bias_mode == 1 || bias_mode == 2){
+      ye = new SymbolEmbedding(model, td.size(), TAG_DIM);
+    }else if (bias_mode == 3){
+      // zero out the y embeddings, this gives no information to the next step, the model can only rely on the x
+      ye = new SymbolEmbedding(model, td.size(), TAG_DIM, true);
+    }
 
     p_cth = model.add_parameters({TAG_HIDDEN_DIM, XCRIBE_DIM});
     p_h_rnn_lastth = model.add_parameters({TAG_HIDDEN_DIM, TAG_RNN_HIDDEN_DIM});
@@ -239,6 +272,7 @@ struct ModelOne {
     }
     tagrnn.start_new_sequence();
     ye->new_graph(cg);
+
     tagrnn.add_input(ye->embed(TAGSOS));
 
     for(unsigned int t = 0; t < len+1; ++t){
@@ -391,6 +425,8 @@ struct ModelOne {
         MyVectorInt *myvector_int_in_child = segment_in_child_int.find<MyVectorInt>(vector_name_int.c_str()).first;
         MyVectorFloat *myvector_float_in_child = segment_in_child_float.find<MyVectorFloat>(vector_name_float.c_str()).first;
 
+        float sen_log_prob = 0;
+
         //child
         tagrnn.new_graph(cg);  // reset RNN builder for new graph
         if(use_dropout){
@@ -402,8 +438,6 @@ struct ModelOne {
         ye->new_graph(cg);
         tagrnn.add_input(ye->embed(TAGSOS));
 
-        vector<Expression> errs;
-
         for(unsigned int t = 0; t < len+1; ++t){
           // first compute the y tag at this step
           // the factor -- last time h from forward tag rnn
@@ -412,9 +446,9 @@ struct ModelOne {
           Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
           Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * annel;
           unsigned sample_i = 0;
+          Expression res = softmax(i_t);
+          vector<float> dist = as_vector(cg.get_value(res.i));
           if(t < len){
-            Expression res = softmax(i_t);
-            vector<float> dist = as_vector(cg.get_value(res.i));
             do {
               sample_i = SampleFromDist(dist);
             } while((int) sample_i == TAGSOS || (int) sample_i == TAGEOS);
@@ -422,13 +456,10 @@ struct ModelOne {
             // add to the tag rnn
             tagrnn.add_input(ye->embed(sample_i));
           }
-
-          Expression i_err = pickneglogsoftmax(i_t, t < len ? sample_i : TAGEOS);
-          errs.push_back(i_err);
+          sen_log_prob = sen_log_prob + (t < len ? log(dist[sample_i]) : log(dist[TAGEOS]));
         }
 
-        Expression error = sum(errs);
-        float v_e = as_scalar(cg.get_value(error.i));
+        float v_e = -sen_log_prob;
         (*myvector_float_in_child)[cid] = v_e;
         exit(0);
       }else if (pid > 0){
@@ -634,7 +665,7 @@ double evaluate_POS(vector<vector<int>>& y_preds,
     }
   }
   double f = (double)(correct) / (double)(total);
-  cerr << "acc: " << f << endl;
+  logfile << "acc: " << f << endl;
   return f;
 }
 
@@ -736,7 +767,7 @@ double evaluate_NER(vector<vector<int>>& y_preds,
   double p = (double)(p_correct) / (double)(p_total);
   double r = (double)(r_correct) / (double)(r_total);
   double f = 2.0 * ((p * r) / (p + r));
-  cerr << "p: " << p << "\tr: " << r << "\tf: " << f << endl;
+  logfile << "p: " << p << "\tr: " << r << "\tf: " << f << endl;
   return f;
 }
 
@@ -779,13 +810,13 @@ double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
     y_preds.push_back(y_pred);
   }
   double f = ner_tagging ? evaluate_NER(y_preds, y_golds, modelone.d, modelone.td) : evaluate_POS(y_preds, y_golds, modelone.d, modelone.td);
-  cerr << set_name << endl;
+  logfile << set_name << endl;
   return f;
 }
 
 
 int main(int argc, char** argv) {
-  cnn::Initialize(argc, argv, 1, true);
+  cnn::Initialize(argc, argv, 0, true);
   unsigned dev_every_i_reports;
   float annel_value;
   po::options_description desc("Allowed options");
@@ -815,6 +846,7 @@ int main(int argc, char** argv) {
       ("pm_tag_dim", po::value<unsigned>(&TAG_DIM)->default_value(128), "tag dim")
       ("pm_tag_hidden_dim", po::value<unsigned>(&TAG_HIDDEN_DIM)->default_value(256), "tag hidden dim")
       ("ner", po::bool_switch(&ner_tagging)->default_value(false), "the ner mode")
+      ("bias_mode", po::value<int>(&bias_mode)->default_value(0), "bias the model in some interesting ways, 0 means no bias, 1 means bias to the left, 2 means bias to the right, 3 means only use observation to predict")
   ;
 
   po::variables_map vm;
@@ -871,8 +903,8 @@ int main(int argc, char** argv) {
       read_file(vm["test_file"].as<string>(), d, td, test);
     }
     
-    float eta_decay_rate = vm["eta_decay_onset_epoch"].as<unsigned>();
-    unsigned eta_decay_onset_epoch = vm["eta_decay_rate"].as<float>();
+    float eta_decay_rate = vm["eta_decay_rate"].as<float>();
+    unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<unsigned>();
 
     logfile << "eta_decay_rate: " << eta_decay_rate << endl;
     logfile << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;

@@ -509,8 +509,8 @@ int main(int argc, char** argv) {
       read_file(vm["test_file"].as<string>(), d, td, test);
     }
     
-    float eta_decay_rate = vm["eta_decay_onset_epoch"].as<unsigned>();
-    unsigned eta_decay_onset_epoch = vm["eta_decay_rate"].as<float>();
+    float eta_decay_rate = vm["eta_decay_rate"].as<unsigned>();
+    unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<float>();
 
     cerr << "eta_decay_rate: " << eta_decay_rate << endl;
     cerr << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;

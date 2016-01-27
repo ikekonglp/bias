@@ -438,7 +438,7 @@ double predict_and_evaluate(ModelTwo<LSTMBuilder>& modeltwo,
 
 
 int main(int argc, char** argv) {
-  cnn::Initialize(argc, argv);
+  cnn::Initialize(argc, argv, 0, true);
   unsigned dev_every_i_reports;
   unsigned int sample_num;
   po::options_description desc("Allowed options");
@@ -521,8 +521,8 @@ int main(int argc, char** argv) {
       read_reranking_file(vm["test_file"].as<string>() + ".reranking", d, td, test_reranking);
     }
     
-    float eta_decay_rate = vm["eta_decay_onset_epoch"].as<unsigned>();
-    unsigned eta_decay_onset_epoch = vm["eta_decay_rate"].as<float>();
+    float eta_decay_rate = vm["eta_decay_rate"].as<float>();
+    unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<unsigned>();
 
     cerr << "eta_decay_rate: " << eta_decay_rate << endl;
     cerr << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;

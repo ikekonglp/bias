@@ -163,7 +163,7 @@ struct BiTrans {
     for (int i = 0; i < len; ++i)
       res[i] = affine_transform({cb, f2c, fwd[i], r2c, rev[i]});
 
-    start_c = affine_transform({cb, f2c, l2r_start, r2c, r2l_end});\
+    start_c = affine_transform({cb, f2c, l2r_start, r2c, r2l_end});
     end_c = affine_transform({cb, f2c, l2r_end, r2c, r2l_start});
 
     return res;
@@ -252,7 +252,7 @@ struct ModelThree {
       Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
-      Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
+      Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS) + square(log(sum_cols(exp(transpose(i_t)))));
       errs.push_back(i_err);
       // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
       if(t < len){
@@ -322,7 +322,7 @@ struct ModelThree {
         if(t < len){
           tagrnn.add_input(ye->embed(sample[t]));
         }
-        Expression i_err = pickneglogsoftmax(i_t, t < len ? sample[t] : TAGEOS);
+        Expression i_err = - pick (i_t, t < len ? sample[t] : TAGEOS);
         szx.push_back(i_err);
       }
       zx_elements.push_back(sum(szx) * alpha);
@@ -342,7 +342,7 @@ struct ModelThree {
         if(t < len){
           tagrnn.add_input(ye->embed(y[t]));
         }
-        Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
+        Expression i_err =  - pick(i_t, t < len ? y[t] : TAGEOS);
         szx.push_back(i_err);
       }
       score_xy = sum(szx) * alpha;
@@ -397,7 +397,7 @@ struct ModelThree {
         // in the decoding mode, we can only push the predicted tag
         tagrnn.add_input(ye->embed(besti));
       }
-      Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
+      Expression i_err = - pick(i_t, t < len ? y[t] : TAGEOS);
       errs.push_back(i_err);
     }
     return sum(errs);
@@ -528,7 +528,9 @@ void SampleParallel(const vector<int> x,
         //Find the vector using the c-string name
         MyVectorInt *myvector_int_in_child = segment_in_child_int.find<MyVectorInt>(vector_name_int.c_str()).first;
         MyVectorFloat *myvector_float_in_child = segment_in_child_float.find<MyVectorFloat>(vector_name_float.c_str()).first;
-
+        
+        float sen_log_prob = 0;
+        
         //child
         tagrnn.new_graph(cg);  // reset RNN builder for new graph
         if(use_dropout){
@@ -550,9 +552,9 @@ void SampleParallel(const vector<int> x,
           Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
           Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * annel;
           unsigned sample_i = 0;
+          Expression res = softmax(i_t);
+          vector<float> dist = as_vector(cg.get_value(res.i));
           if(t < len){
-            Expression res = softmax(i_t);
-            vector<float> dist = as_vector(cg.get_value(res.i));
             do {
               sample_i = SampleFromDist(dist);
             } while((int) sample_i == TAGSOS || (int) sample_i == TAGEOS);
@@ -560,13 +562,10 @@ void SampleParallel(const vector<int> x,
             // add to the tag rnn
             tagrnn.add_input(ye->embed(sample_i));
           }
-
-          Expression i_err = pickneglogsoftmax(i_t, t < len ? sample_i : TAGEOS);
-          errs.push_back(i_err);
+          sen_log_prob = sen_log_prob + (t < len ? log(dist[sample_i]) : log(dist[TAGEOS]));
         }
 
-        Expression error = sum(errs);
-        float v_e = as_scalar(cg.get_value(error.i));
+        float v_e = -sen_log_prob;
         (*myvector_float_in_child)[cid] = v_e;
         exit(0);
       }else if (pid > 0){
@@ -791,7 +790,7 @@ double predict_and_evaluate(ModelThree<LSTMBuilder>& modelthree,
 
 
 int main(int argc, char** argv) {
-  cnn::Initialize(argc, argv, 1, true);
+  cnn::Initialize(argc, argv, 0, true);
   unsigned dev_every_i_reports;
   float annel_value;
   po::options_description desc("Allowed options");
@@ -803,7 +802,7 @@ int main(int argc, char** argv) {
       ("test", po::bool_switch()->default_value(false), "the test mode")
       ("sample", po::bool_switch()->default_value(false), "the sample mode -- for each sentence, generate sample_num samples")
       ("sample_num", po::value<unsigned int>()->default_value(100), "the number of samples for each sentence")
-      ("alpha", po::value<float>()->default_value(0.005f), "the alpha used in q distribution")
+      ("alpha", po::value<float>()->default_value(0.05f), "the alpha used in q distribution")
       ("dev_every_i_reports", po::value<unsigned>(&dev_every_i_reports)->default_value(1000))
       ("evaluate_test", po::bool_switch()->default_value(false), "evaluate test set every training iteration")
       ("train_file", po::value<string>(), "path of the train file")
@@ -815,7 +814,7 @@ int main(int argc, char** argv) {
       ("eta_decay_onset_epoch", po::value<unsigned>()->default_value(8), "start decaying eta every epoch after this epoch (try 8)")
       ("eta_decay_rate", po::value<float>()->default_value(0.5f), "how much to decay eta by (recommended 0.5)")
       ("dropout_rate", po::value<float>(), "dropout rate, also indicts using dropout during training")
-      ("annel_value", po::value<float>(&annel_value)->default_value(0.8f), "annel value when sampling")
+      ("annel_value", po::value<float>(&annel_value)->default_value(1.0f), "annel value when sampling")
   ;
 
   po::variables_map vm;
@@ -871,8 +870,8 @@ int main(int argc, char** argv) {
       read_file(vm["test_file"].as<string>(), d, td, test);
     }
     
-    float eta_decay_rate = vm["eta_decay_onset_epoch"].as<unsigned>();
-    unsigned eta_decay_onset_epoch = vm["eta_decay_rate"].as<float>();
+    float eta_decay_rate = vm["eta_decay_rate"].as<float>();
+    unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<unsigned>();
 
     cerr << "eta_decay_rate: " << eta_decay_rate << endl;
     cerr << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;
@@ -922,7 +921,7 @@ int main(int argc, char** argv) {
         auto& sent = training[order[si]];
         ++si;
 
-        // if (report < 30){
+        // if (report < 50){
         //   cerr << "pretrain " << endl;
         //   ComputationGraph cg;
         //   vector<Expression> xins = modelthree.ConstructInput(sent.first, cg);
@@ -934,7 +933,7 @@ int main(int argc, char** argv) {
         //   sgd->update(1.0);
         //   ++lines;
         // }else{
-          // cerr << "crf " << endl;
+          cerr << "crf " << endl;
           unsigned int sample_num = vm["sample_num"].as<unsigned int>();
           vector<vector<int>> y_samples_v(sample_num);
           vector<float> y_scores;
@@ -969,7 +968,7 @@ int main(int argc, char** argv) {
         double f = predict_and_evaluate(modelthree, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
         if (f > f_best) {
           f_best = f;
-          save_models(vm["model_file_prefix"].as<string>(), d, td, model);
+          // save_models(vm["model_file_prefix"].as<string>(), d, td, model);
         }
         if (vm["evaluate_test"].as<bool>()){
           predict_and_evaluate(modelthree, test, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value, "TEST");
