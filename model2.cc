@@ -41,9 +41,11 @@ bool ner_tagging = false;
 string pretrained_embeding = "";
 ClassFactoredSoftmaxBuilder* cfsm = nullptr;
 
+ofstream logfile;
+
 int SampleFromDist(vector<float> dist){
   unsigned w = 0;
-  double p = rand01();
+  float p = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
   for (; w < dist.size(); ++w) {
     p -= dist[w];
     if (p < 0.0) { break; }
@@ -174,7 +176,7 @@ struct ModelTwo {
   }
 
   void RandomSample(int max_len = 150){
-    cerr << endl;
+    logfile << endl;
 
     vector<int> gen_y;
     vector<int> gen_x;
@@ -209,7 +211,7 @@ struct ModelTwo {
       cur = w;
       if(cur == TAGEOS) break;
       gen_y.push_back(cur);
-      // cerr << (len == 1 ? "" : " ") << d.Convert(cur);
+      // logfile << (len == 1 ? "" : " ") << d.Convert(cur);
       ++len;
     }
 
@@ -227,12 +229,12 @@ struct ModelTwo {
       gen_x.push_back(w);
     }
 
-    cerr << "Sample: " << endl;
+    logfile << "Sample: " << endl;
     assert(gen_x.size() == gen_y.size());
     for(unsigned i = 0; i < gen_y.size(); ++i){
-      cerr << ((i == 0) ? "" : " ") << d.Convert(gen_x[i]) << "/" << td.Convert(gen_y[i]);
+      logfile << ((i == 0) ? "" : " ") << d.Convert(gen_x[i]) << "/" << td.Convert(gen_y[i]);
     }
-    cerr << endl;
+    logfile << endl;
   }
 };
 
@@ -263,7 +265,7 @@ pair<vector<int>,vector<int>> ParseTrainingInstance(const std::string& line, cnn
   return make_pair(x, y);
 }
 
-double evaluate(vector<vector<int>>& y_preds,
+double evaluate_POS(vector<vector<int>>& y_preds,
                 vector<vector<int>>& y_golds,
                 cnn::Dict& d,
                 cnn::Dict& td){
@@ -278,8 +280,118 @@ double evaluate(vector<vector<int>>& y_preds,
     }
   }
   double f = (double)(correct) / (double)(total);
-  cerr << "acc: " << f << endl;
-  return f; 
+  logfile << "acc: " << f << endl;
+  return f;
+}
+
+bool extract_tag(int tag, cnn::Dict& td, pair<string, string>& res){
+  if (tag == td.Convert("O") || tag == TAGSOS || tag == TAGEOS) return true;
+  vector<string> fields;
+  boost::algorithm::split( fields, td.Convert(tag), boost::algorithm::is_any_of( "-" ) );
+  assert (fields.size() == 2);
+  res.first = fields[0];
+  res.second = fields[1];
+  return false;
+}
+
+void extract_ners(vector<int> tags, cnn::Dict& td, std::set<pair<pair<int, int>, string>>& ners){
+  int i = 0;
+
+  // cerr << endl;
+  // for (auto y_tag :tags){
+  //   cerr << td.Convert(y_tag) << " ";
+  // }
+  // cerr << endl;
+
+  while(i < tags.size()){
+    pair<string, string> res;
+    if (extract_tag(tags[i], td, res)){
+      i++;
+      continue;
+    }
+    if(res.first.compare("S") == 0){
+      ners.insert(make_pair(make_pair(i, i+1), res.second));
+      i++;
+      continue;
+    }
+    if(res.first.compare("B") == 0 || res.first.compare("I") == 0 || res.first.compare("E") == 0){
+      int j;
+      for(j = i+1; j < tags.size()+1; j++){
+        if (j == tags.size()){
+          break;
+        }
+        pair<string, string> res_j;
+        if(extract_tag(tags[j], td, res_j) || res_j.first.compare("B") == 0 || res_j.first.compare("S") == 0){
+          break;
+        }
+      }
+      ners.insert(make_pair(make_pair(i,j), res.second));
+      i = j;
+    }
+  }
+}
+
+double evaluate_NER(vector<vector<int>>& y_preds,
+                vector<vector<int>>& y_golds,
+                cnn::Dict& d,
+                cnn::Dict& td){
+  assert(y_preds.size() == y_golds.size());
+  int p_total = 0;
+  int p_correct = 0;
+  int r_total = 0;
+  int r_correct = 0;
+  for (unsigned int i = 0; i < y_golds.size(); i++){
+    //cerr << "eval " << i << "/" << y_golds.size() << endl;
+    std::set<pair<pair<int, int>, string>> gold_ners;
+    extract_ners(y_golds[i], td, gold_ners);
+    std::set<pair<pair<int, int>, string>> pred_ners;
+    extract_ners(y_preds[i], td, pred_ners);
+
+    // cerr << endl;
+    // for (auto y_tag : y_golds[i]){
+    //   cerr << td.Convert(y_tag) << " ";
+    // }
+    // cerr << endl;
+    // for (auto y_ner : gold_ners){
+    //   cerr << y_ner.first.first << " " << y_ner.first.second << " " << y_ner.second << endl;
+    // }
+
+    // cerr << endl;
+    // for (auto y_tag : y_preds[i]){
+    //   cerr << td.Convert(y_tag) << " ";
+    // }
+    // cerr << endl;
+    // for (auto y_ner : pred_ners){
+    //   cerr << y_ner.first.first << " " << y_ner.first.second << " " << y_ner.second << endl;
+    // }
+    // cerr << endl;
+
+    for (auto pred : pred_ners){
+      if(gold_ners.find(pred) != gold_ners.end()){
+        p_correct++;
+      }
+      p_total++;
+    }
+    for (auto gold : gold_ners){
+      if(pred_ners.find(gold) != pred_ners.end()){
+        r_correct++;
+      }
+      r_total++;
+    }
+  }
+  double p = (double)(p_correct) / (double)(p_total);
+  double r = (double)(r_correct) / (double)(r_total);
+  double f = 2.0 * ((p * r) / (p + r));
+  logfile << "p: " << p << "\tr: " << r << "\tf: " << f << endl;
+  return f;
+}
+
+double evaluate(vector<vector<int>>& y_preds,
+                vector<vector<int>>& y_golds,
+                cnn::Dict& d,
+                cnn::Dict& td){
+  double f = ner_tagging ? evaluate_NER(y_preds, y_golds, d, td) : evaluate_POS(y_preds, y_golds, d, td);
+  return f;
 }
 
 void test_only(ModelTwo<LSTMBuilder>& modeltwo,
@@ -311,7 +423,7 @@ void read_file(string file_path,
 {
   read_set.clear();
   string line;
-  cerr << "Reading data from " << file_path << "...\n";
+  logfile << "Reading data from " << file_path << "...\n";
   {
     ifstream in(file_path);
     assert(in);
@@ -319,7 +431,7 @@ void read_file(string file_path,
       read_set.push_back(ParseTrainingInstance(line, d, td, test_only));
     }
   }
-  cerr << "Reading data from " << file_path << " finished \n";
+  logfile << "Reading data from " << file_path << " finished \n";
 }
 
 void read_reranking_file(string file_path,
@@ -329,7 +441,7 @@ void read_reranking_file(string file_path,
 {
   reranking_set.clear();
   string line;
-  cerr << "Reading reranking list from " << file_path << "...\n";
+  logfile << "Reading reranking list from " << file_path << "...\n";
   {
     ifstream in(file_path);
     assert(in);
@@ -350,7 +462,7 @@ void save_models(string model_file_prefix,
                     cnn::Dict& d,
                     cnn::Dict& td,
                     Model& model){
-  cerr << "saving models..." << endl;
+  logfile << "saving models..." << endl;
 
   const string f_name = model_file_prefix + ".params";
   ofstream out(f_name);
@@ -369,12 +481,12 @@ void save_models(string model_file_prefix,
   boost::archive::text_oarchive oa_td(out_td);
   oa_td << td;
   out_td.close();
-  cerr << "saving models finished" << endl;
+  logfile << "saving models finished" << endl;
 }
 
 void load_models(string model_file_prefix,
                  Model& model){
-  cerr << "loading models..." << endl;
+  logfile << "loading models..." << endl;
 
   string fname = model_file_prefix + ".params";
   ifstream in(fname);
@@ -382,14 +494,14 @@ void load_models(string model_file_prefix,
   ia >> model;
   in.close();
 
-  cerr << "loading models finished" << endl;
+  logfile << "loading models finished" << endl;
 }
 
 void load_dicts(string model_file_prefix,
                  cnn::Dict& d,
                  cnn::Dict& td)
 {
-  cerr << "loading dicts..." << endl;
+  logfile << "loading dicts..." << endl;
   string f_d_name = model_file_prefix + ".dict";
   ifstream in_d(f_d_name);
   boost::archive::text_iarchive ia_d(in_d);
@@ -401,7 +513,7 @@ void load_dicts(string model_file_prefix,
   boost::archive::text_iarchive ia_td(in_td);
   ia_td >> td;
   in_td.close();
-  cerr << "loading dicts finished" << endl;
+  logfile << "loading dicts finished" << endl;
 }
 
 double predict_and_evaluate(ModelTwo<LSTMBuilder>& modeltwo,
@@ -432,7 +544,7 @@ double predict_and_evaluate(ModelTwo<LSTMBuilder>& modeltwo,
     y_preds.push_back(reranking_set[best_ind]);
   }
   double f = evaluate(y_preds, y_golds, modeltwo.d, modeltwo.td);
-  cerr << set_name << endl;
+  logfile << set_name << endl;
   return f;
 }
 
@@ -460,6 +572,7 @@ int main(int argc, char** argv) {
       ("eta_decay_onset_epoch", po::value<unsigned>()->default_value(8), "start decaying eta every epoch after this epoch (try 8)")
       ("eta_decay_rate", po::value<float>()->default_value(0.5f), "how much to decay eta by (recommended 0.5)")
       ("dropout_rate", po::value<float>(), "dropout rate, also indicts using dropout during training")
+      ("ner", po::bool_switch(&ner_tagging)->default_value(false), "the ner mode")
   ;
 
   po::variables_map vm;
@@ -471,15 +584,17 @@ int main(int argc, char** argv) {
       return 1;
   }
 
+  logfile.open(vm["model_file_prefix"].as<string>() + ".log", ios::out);
+
 
   if(vm["train"].as<bool>()){
     if (vm.count("upe")){
-      cerr << "using pre-trained embeding from " << vm["upe"].as<string>() << endl;
+      logfile << "using pre-trained embeding from " << vm["upe"].as<string>() << endl;
       use_pretrained_embeding = true;
       pretrained_embeding = vm["upe"].as<string>();
     }else{
       use_pretrained_embeding = false;
-      cerr << "not using pre-trained embeding" << endl;
+      logfile << "not using pre-trained embeding" << endl;
     }
 
     bool use_dropout = false;
@@ -488,7 +603,7 @@ int main(int argc, char** argv) {
       dropout_rate = vm["dropout_rate"].as<float>();
       use_dropout = (dropout_rate > 0);
       if(use_dropout){
-        cerr << "using dropout training, dropout rate: " << dropout_rate << endl;
+        logfile << "using dropout training, dropout rate: " << dropout_rate << endl;
       }
     }else{
       use_dropout = false;
@@ -524,8 +639,8 @@ int main(int argc, char** argv) {
     float eta_decay_rate = vm["eta_decay_rate"].as<float>();
     unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<unsigned>();
 
-    cerr << "eta_decay_rate: " << eta_decay_rate << endl;
-    cerr << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;
+    logfile << "eta_decay_rate: " << eta_decay_rate << endl;
+    logfile << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;
 
     
     // auto sgd = new SimpleSGDTrainer(&model);
@@ -561,7 +676,7 @@ int main(int argc, char** argv) {
           completed_epoch++;
           if (eta_decay_onset_epoch && completed_epoch >= (int)eta_decay_onset_epoch)
             sgd->eta *= eta_decay_rate;
-          cerr << "**SHUFFLE\n";
+          logfile << "**SHUFFLE" << endl;
           shuffle(order.begin(), order.end(), *rndeng);
         }
 
@@ -577,7 +692,7 @@ int main(int argc, char** argv) {
         ++lines;
       }
       sgd->status();
-      cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") ";
+      logfile << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") "  << endl;
       report++;
       if (report % dev_every_i_reports == 0) {
         double f = predict_and_evaluate(modeltwo, dev, dev_reranking, sample_num);
@@ -606,6 +721,7 @@ int main(int argc, char** argv) {
     
     test_only(modeltwo, test);
   }
+  logfile.close();
 }
 
 

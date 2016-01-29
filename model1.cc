@@ -14,7 +14,6 @@
 #include <sstream>
 #include <cstdlib>
 #include <set>
-#include <omp.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <math.h>
@@ -65,11 +64,9 @@ bool ner_tagging = false;
 string pretrained_embeding = "";
 int bias_mode = 0;
 
-ofstream logfile;
-
 int SampleFromDist(vector<float> dist){
   unsigned w = 0;
-  double p = rand01();
+  float p = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
   for (; w < dist.size(); ++w) {
     p -= dist[w];
     if (p < 0.0) { break; }
@@ -77,6 +74,16 @@ int SampleFromDist(vector<float> dist){
   // this should not really happen?
   if (w == dist.size()) w = dist.size() - 1;
   return w;
+}
+
+bool extract_tag(int tag, cnn::Dict& td, pair<string, string>& res){
+  if (tag == td.Convert("O") || tag == TAGSOS || tag == TAGEOS) return true;
+  vector<string> fields;
+  boost::algorithm::split( fields, td.Convert(tag), boost::algorithm::is_any_of( "-" ) );
+  assert (fields.size() == 2);
+  res.first = fields[0];
+  res.second = fields[1];
+  return false;
 }
 
 // returns embeddings of labels
@@ -249,7 +256,8 @@ struct ModelOne {
                             ComputationGraph& cg,
                             bool use_dropout,
                             float dropout_rate = 0,
-                            bool training_mode = true) {
+                            bool training_mode = true,
+                            float self_normalize_alpha_v = 0) {
     int len = xins.size();
     y_decode.clear();
 
@@ -274,7 +282,7 @@ struct ModelOne {
     ye->new_graph(cg);
 
     tagrnn.add_input(ye->embed(TAGSOS));
-
+    float total_nz = 0;
     for(unsigned int t = 0; t < len+1; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
@@ -283,7 +291,17 @@ struct ModelOne {
       Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
       Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
 
-      Expression i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
+      Expression i_err;
+      if(training_mode && self_normalize_alpha_v > 0){
+        Expression self_normalize_alpha = input(cg, self_normalize_alpha_v);
+        Expression nz = square(log(sum_cols(exp(transpose(i_t)))));
+        i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS) + self_normalize_alpha * nz;
+        // float nz_f = as_scalar(cg.get_value(nz.i));
+        // total_nz += nz_f;
+        // cerr << nz_f << endl;
+      }else{
+        i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
+      } 
       errs.push_back(i_err);
       // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
       if(t < len){
@@ -305,7 +323,53 @@ struct ModelOne {
         }
       }
     }
+    // cerr << "here:\t " << total_nz << endl;
     return sum(errs);
+  }
+
+  float ComputeZ(vector<Expression>& xins,
+                 const vector<int>& y,
+                 ComputationGraph& cg) {
+    int len = xins.size();
+
+    Expression i_thbias = parameter(cg, p_thbias);
+    Expression i_cth = parameter(cg, p_cth);
+    Expression i_h_rnn_lastth = parameter(cg, p_h_rnn_lastth);
+    Expression i_tbias = parameter(cg, p_tbias);
+    Expression i_th2t = parameter(cg, p_th2t);
+
+    vector<Expression> errs;
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, false, 0);
+    
+    // Construct the forward rnn over y tags
+    tagrnn.new_graph(cg);  // reset RNN builder for new graph
+
+    tagrnn.disable_dropout();
+    
+    tagrnn.start_new_sequence();
+    ye->new_graph(cg);
+
+    tagrnn.add_input(ye->embed(TAGSOS));
+
+    for(unsigned int t = 0; t < len+1; ++t){
+      // first compute the y tag at this step
+      // the factor -- last time h from forward tag rnn
+      Expression h_rnn_last = tagrnn.back();
+      // the factor -- c from the bi-rnn at this time step
+      Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
+      Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+
+      Expression i_err;
+      i_err = square(log(sum_cols(exp(transpose(i_t)))));
+      errs.push_back(i_err);
+      // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
+      if(t < len){
+          tagrnn.add_input(ye->embed(y[t]));
+      }
+    }
+    Expression total_z = sum(errs);
+    return sqrt(as_scalar(cg.get_value(total_z.i)));
   }
 
   void Sample(const vector<int> x,
@@ -378,7 +442,7 @@ struct ModelOne {
     Expression annel = input(cg, annel_value);
     Expression start_c, end_c;
     vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, use_dropout, dropout_rate);
-    string sufix = model_file_prefix + "_" +to_string(time(0)) + to_string(rand());
+    string sufix = to_string(getpid()) + to_string(rand());
     string mem_name_int = "MySharedMemoryInt_" + sufix;
     string vector_name_int = "MyVectorInt_" + sufix;
     string mem_name_float = "MySharedMemoryFloat_" + sufix;
@@ -418,6 +482,8 @@ struct ModelOne {
         abort();
       }
       else if (pid == 0) {
+        srand(time(NULL) ^ (getpid()<<16) + cid * 2);
+
         ip::managed_shared_memory segment_in_child_int(ip::open_only, mem_name_int.c_str());
         ip::managed_shared_memory segment_in_child_float(ip::open_only, mem_name_float.c_str());
 
@@ -448,10 +514,44 @@ struct ModelOne {
           unsigned sample_i = 0;
           Expression res = softmax(i_t);
           vector<float> dist = as_vector(cg.get_value(res.i));
+          bool resample;
           if(t < len){
             do {
+              resample = false;
               sample_i = SampleFromDist(dist);
-            } while((int) sample_i == TAGSOS || (int) sample_i == TAGEOS);
+              if(ner_tagging){
+                pair<string, string> res;
+                extract_tag(sample_i, td, res);
+                if(t == 0){
+                  if(res.first.compare("I") == 0 || res.first.compare("E") == 0){
+                    resample = true;
+                    continue;
+                  }
+                }else if(t > 0){
+                  if(res.first.compare("I") == 0){
+                    int previous_tag = (*myvector_int_in_child)[cid * len + t-1];
+                    pair<string, string> prev;
+                    extract_tag(previous_tag, td, prev);
+                    if(previous_tag == sample_i || (prev.second.compare(res.second) == 0 && prev.first.compare("B") == 0) ){
+                      resample = false;
+                    }else{
+                      resample = true;
+                      continue;
+                    }
+                  }else if(res.first.compare("E") == 0){
+                    int previous_tag = (*myvector_int_in_child)[cid * len + t-1];
+                    pair<string, string> prev;
+                    extract_tag(previous_tag, td, prev);
+                    if(prev.second.compare(res.second) == 0 && (prev.first.compare("I") == 0 || prev.first.compare("B") == 0)){
+                      resample = false;
+                    }else{
+                      resample = true;
+                      continue;
+                    }
+                  }
+                }
+              }
+            } while(resample || (int) sample_i == TAGSOS || (int) sample_i == TAGEOS);
             (*myvector_int_in_child)[cid * len + t] = (int)sample_i;
             // add to the tag rnn
             tagrnn.add_input(ye->embed(sample_i));
@@ -473,7 +573,7 @@ struct ModelOne {
     }
 
    // for (int i = 0; i < sample_num * len; ++i){
-   //  logfile << "parent " << "i = " << (*myvector_int)[i]  << endl;
+   //  cerr << "parent " << "i = " << (*myvector_int)[i]  << endl;
    // }
    for (unsigned int i = 0; i < sample_num; ++i){
     for (unsigned int j = 0; j < len; ++j){
@@ -487,9 +587,111 @@ struct ModelOne {
    ip::message_queue::remove(mem_name_float.c_str());
    return;
   }
+
+  void rerank_parallel(const vector<int> &x,
+                       vector<int> &y_pred,
+                       unsigned int sent_id,
+                       const vector<vector<int>>& reranking_set,
+                       unsigned int sample_num,
+                       string model_file_prefix){
+    ComputationGraph cg;
+    vector<Expression> xins = ConstructInput(x, cg);
+    int len = xins.size();
+
+    Expression i_thbias = parameter(cg, p_thbias);
+    Expression i_cth = parameter(cg, p_cth);
+    Expression i_h_rnn_lastth = parameter(cg, p_h_rnn_lastth);
+    Expression i_tbias = parameter(cg, p_tbias);
+    Expression i_th2t = parameter(cg, p_th2t);
+
+    Expression start_c, end_c;
+    vector<Expression> c = bt.transcribe(cg, xins, xe->embed(TOKENSOS), xe->embed(TOKENEOS), start_c, end_c, false, 0);
+    string sufix = to_string(getpid()) + "_d_" + to_string(rand());
+    string mem_name_float = "MySharedMemoryFloat_" + sufix;
+    string vector_name_float = "MyVectorFloat_" + sufix;
+
+    assert (cnn::ps->is_shared());
+
+    ip::message_queue::remove(mem_name_float.c_str());
+
+    //Create a new segment with given name and size
+    ip::managed_shared_memory segment_float(ip::create_only, mem_name_float.c_str(), 2 * sizeof(float) * sample_num);
+    //Initialize shared memory STL-compatible allocator
+    const ShmemAllocatorFloat alloc_inst_float (segment_float.get_segment_manager());
+
+    MyVectorFloat *myvector_float = segment_float.construct<MyVectorFloat>(vector_name_float.c_str())(alloc_inst_float);
+
+    for(int i = 0; i < sample_num; ++i){
+       myvector_float->push_back(9e99);
+    }
+
+    vector<pid_t> cp_ids; 
+    // Fork to many processes
+    pid_t pid;
+    unsigned cid;
+    for (cid = 0; cid < sample_num; ++cid) {
+      pid = fork();
+      if (pid == -1) {
+        cerr << "Fork failed. Exiting ..." << std::endl;
+        abort();
+      }
+      else if (pid == 0) {
+        ip::managed_shared_memory segment_in_child_float(ip::open_only, mem_name_float.c_str());
+
+        //Find the vector using the c-string name
+        MyVectorFloat *myvector_float_in_child = segment_in_child_float.find<MyVectorFloat>(vector_name_float.c_str()).first;
+
+        float sen_log_prob = 0;
+        tagrnn.new_graph(cg);
+        //child
+        tagrnn.disable_dropout();
+        
+        tagrnn.start_new_sequence();
+        ye->new_graph(cg);
+        tagrnn.add_input(ye->embed(TAGSOS));
+
+        for(unsigned int t = 0; t < len+1; ++t){
+          // first compute the y tag at this step
+          // the factor -- last time h from forward tag rnn
+          Expression h_rnn_last = tagrnn.back();
+          // the factor -- c from the bi-rnn at this time step
+          Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
+          Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+          
+          Expression res = softmax(i_t);
+          vector<float> dist = as_vector(cg.get_value(res.i));
+          if(t < len){
+            tagrnn.add_input(ye->embed(reranking_set[sent_id * sample_num + cid][t]));
+          }
+          sen_log_prob = sen_log_prob + (t < len ? log(dist[reranking_set[sent_id * sample_num + cid][t]]) : log(dist[TAGEOS]));
+        }
+        float v_e = -sen_log_prob;
+        (*myvector_float_in_child)[cid] = v_e;
+        exit(0);
+      }else if (pid > 0){
+          cp_ids.push_back(pid);
+      }
+    }
+    assert(cp_ids.size() == sample_num);
+    for (auto cp_id : cp_ids){
+      int returnStatus;    
+      waitpid(cp_id, &returnStatus, 0);  // Parent process waits here for child to terminate.
+    }
+    float best_score = 9e99;
+    unsigned best_i = 0;
+   for (unsigned int i = 0; i < sample_num; ++i){
+    if((*myvector_float)[i] < best_score){
+      best_score = (*myvector_float)[i];
+      best_i = i;
+    }
+   }
+   y_pred = reranking_set[sent_id * sample_num + best_i];
+   ip::message_queue::remove(mem_name_float.c_str());
+  }
 };
 
-pair<vector<int>,vector<int>> ParseTrainingInstance(const std::string& line, cnn::Dict& d, cnn::Dict& td, bool test_only = false) {
+pair<vector<int>,vector<int>> ParseTrainingInstance(const std::string& line, cnn::Dict& d, cnn::Dict& td) {
+  bool test_only = false;
   std::istringstream in(line);
   std::string word;
   std::string sep = "|||";
@@ -515,141 +717,6 @@ pair<vector<int>,vector<int>> ParseTrainingInstance(const std::string& line, cnn
   }
   return make_pair(x, y);
 }
-
-double evaluate(vector<vector<int>>& y_preds,
-                vector<vector<int>>& y_golds,
-                cnn::Dict& d,
-                cnn::Dict& td){
-  assert(y_preds.size() == y_golds.size());
-  int correct = 0;
-  int total = 0;
-  for (unsigned int i = 0; i < y_preds.size(); i++){
-    assert(y_preds[i].size() == y_golds[i].size());
-    total += y_preds[i].size();
-    for (unsigned int j = 0; j < y_preds[i].size(); j++){
-      correct += ((y_preds[i][j] == y_golds[i][j]) ? 1 : 0);
-    }
-  }
-  double f = (double)(correct) / (double)(total);
-  logfile << "acc: " << f << endl;
-  return f; 
-}
-
-void test_only(ModelOne<LSTMBuilder>& modelone,
-          vector<pair<vector<int>,vector<int>>>&test_set)
-{
-  for (auto& sent : test_set) {
-    ComputationGraph cg;
-    vector<int> y_pred;
-    vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
-    modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, false);
-    unsigned int i;
-    for(i = 0; i < y_pred.size()-1; ++i){
-      auto pred = modelone.td.Convert(y_pred[i]);
-      cout << pred << " ";
-    }
-    auto pred = modelone.td.Convert(y_pred[i]);
-    cout << pred;
-    cout << endl;
-  }
-}
-void sample_only(ModelOne<LSTMBuilder>& modelone,
-          vector<pair<vector<int>,vector<int>>>&test_set,
-          unsigned int sample_num){
-  for (auto& sent : test_set) {
-    for (unsigned int si = 0; si < sample_num; ++si){
-      vector<int> y_pred;
-      modelone.Sample(sent.first, y_pred);
-      unsigned int i;
-      for(i = 0; i < y_pred.size()-1; ++i){
-        auto pred = modelone.td.Convert(y_pred[i]);
-        cout << pred << " ";
-      }
-      auto pred = modelone.td.Convert(y_pred[i]);
-      cout << pred;
-      cout << endl;
-    }
-  }
-}
-
-
-void read_file(string file_path,
-                     cnn::Dict& d,
-                     cnn::Dict& td,
-                     vector<pair<vector<int>,vector<int>>>&read_set,
-                     bool test_only = false)
-{
-  read_set.clear();
-  string line;
-  logfile << "Reading data from " << file_path << "...\n";
-  {
-    ifstream in(file_path);
-    assert(in);
-    while(getline(in, line)) {
-      read_set.push_back(ParseTrainingInstance(line, d, td, test_only));
-    }
-  }
-  logfile << "Reading data from " << file_path << " finished \n";
-}
-
-void save_models(string model_file_prefix,
-                    cnn::Dict& d,
-                    cnn::Dict& td,
-                    Model& model){
-  logfile << "saving models..." << endl;
-
-  const string f_name = model_file_prefix + ".params";
-  ofstream out(f_name);
-  boost::archive::text_oarchive oa(out);
-  oa << model;
-  out.close();
-
-  const string f_d_name = model_file_prefix + ".dict";
-  ofstream out_d(f_d_name);
-  boost::archive::text_oarchive oa_d(out_d);
-  oa_d << d;
-  out_d.close();
-
-  const string f_td_name = model_file_prefix + ".tdict";
-  ofstream out_td(f_td_name);
-  boost::archive::text_oarchive oa_td(out_td);
-  oa_td << td;
-  out_td.close();
-  logfile << "saving models finished" << endl;
-}
-
-void load_models(string model_file_prefix,
-                 Model& model){
-  logfile << "loading models..." << endl;
-
-  string fname = model_file_prefix + ".params";
-  ifstream in(fname);
-  boost::archive::text_iarchive ia(in);
-  ia >> model;
-  in.close();
-
-  logfile << "loading models finished" << endl;
-}
-
-void load_dicts(string model_file_prefix,
-                 cnn::Dict& d,
-                 cnn::Dict& td)
-{
-  logfile << "loading dicts..." << endl;
-  string f_d_name = model_file_prefix + ".dict";
-  ifstream in_d(f_d_name);
-  boost::archive::text_iarchive ia_d(in_d);
-  ia_d >> d;
-  in_d.close();
-
-  string f_td_name = model_file_prefix + ".tdict";
-  ifstream in_td(f_td_name);
-  boost::archive::text_iarchive ia_td(in_td);
-  ia_td >> td;
-  in_td.close();
-  logfile << "loading dicts finished" << endl;
-}
-
 double evaluate_POS(vector<vector<int>>& y_preds,
                 vector<vector<int>>& y_golds,
                 cnn::Dict& d,
@@ -665,19 +732,11 @@ double evaluate_POS(vector<vector<int>>& y_preds,
     }
   }
   double f = (double)(correct) / (double)(total);
-  logfile << "acc: " << f << endl;
+  cerr << "acc: " << f << endl;
   return f;
 }
 
-bool extract_tag(int tag, cnn::Dict& td, pair<string, string>& res){
-  if (tag == td.Convert("O") || tag == TAGSOS || tag == TAGEOS) return true;
-  vector<string> fields;
-  boost::algorithm::split( fields, td.Convert(tag), boost::algorithm::is_any_of( "-" ) );
-  assert (fields.size() == 2);
-  res.first = fields[0];
-  res.second = fields[1];
-  return false;
-}
+
 
 void extract_ners(vector<int> tags, cnn::Dict& td, std::set<pair<pair<int, int>, string>>& ners){
   int i = 0;
@@ -767,9 +826,10 @@ double evaluate_NER(vector<vector<int>>& y_preds,
   double p = (double)(p_correct) / (double)(p_total);
   double r = (double)(r_correct) / (double)(r_total);
   double f = 2.0 * ((p * r) / (p + r));
-  logfile << "p: " << p << "\tr: " << r << "\tf: " << f << endl;
+  cerr << "p: " << p << "\tr: " << r << "\tf: " << f << endl;
   return f;
 }
+
 
 double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
                             const vector<pair<vector<int>,vector<int>>>&input_set,
@@ -797,7 +857,7 @@ double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
   //   y_preds.push_back(y_samples[min_i]);
   // }
   // double f = evaluate(y_preds, y_golds, modelone.d, modelone.td);
-  // logfile << set_name << endl;
+  // cerr << set_name << endl;
   // return f;
   vector<vector<int>> y_preds;
   vector<vector<int>> y_golds;
@@ -810,9 +870,188 @@ double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
     y_preds.push_back(y_pred);
   }
   double f = ner_tagging ? evaluate_NER(y_preds, y_golds, modelone.d, modelone.td) : evaluate_POS(y_preds, y_golds, modelone.d, modelone.td);
-  logfile << set_name << endl;
+  cerr << set_name << endl;
   return f;
 }
+
+double evaluate(vector<vector<int>>& y_preds,
+                vector<vector<int>>& y_golds,
+                cnn::Dict& d,
+                cnn::Dict& td){
+  double f = ner_tagging ? evaluate_NER(y_preds, y_golds, d, td) : evaluate_POS(y_preds, y_golds, d, td);
+  return f;
+}
+
+
+void test_only(ModelOne<LSTMBuilder>& modelone,
+          vector<pair<vector<int>,vector<int>>>&test_set)
+{
+  for (auto& sent : test_set) {
+    ComputationGraph cg;
+    vector<int> y_pred;
+    vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
+    modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, false);
+    unsigned int i;
+    for(i = 0; i < y_pred.size()-1; ++i){
+      auto pred = modelone.td.Convert(y_pred[i]);
+      cout << pred << " ";
+    }
+    auto pred = modelone.td.Convert(y_pred[i]);
+    cout << pred;
+    cout << endl;
+  }
+}
+
+void read_reranking_file(string file_path,
+                         cnn::Dict& d, 
+                         cnn::Dict& td,
+                         vector<vector<int>>& reranking_set)
+{
+  reranking_set.clear();
+  string line;
+  cerr << "Reading reranking list from " << file_path << "...\n";
+  {
+    ifstream in(file_path);
+    assert(in);
+    while(getline(in, line)) {
+      vector <string> fields;
+      boost::algorithm::trim(line);
+      boost::algorithm::split(fields, line, boost::algorithm::is_any_of( " " ));
+      vector<int> tags;
+      for(string m : fields){
+        tags.push_back(td.Convert(m));
+      }
+      reranking_set.push_back(tags);
+    }
+  }
+}
+
+void test_and_evaluate(ModelOne<LSTMBuilder>& modelone,
+                       vector<pair<vector<int>,vector<int>>>&test_set,
+                       vector<vector<int>>& reranking_set,
+                       unsigned int sample_num,
+                       cnn::Dict& d,
+                       cnn::Dict& td,
+                       string model_file_prefix){
+  cerr << "start testing" << endl;
+  assert(test_set.size() * sample_num == reranking_set.size());
+  vector<vector<int>> y_preds;
+  vector<vector<int>> y_golds;
+  for(int sent_id = 0; sent_id < test_set.size(); sent_id++){
+    cerr << "test sentence " << sent_id << endl;
+    auto sent = test_set[sent_id];
+    auto x = sent.first;
+    vector<int> y_pred;
+    modelone.rerank_parallel(x, y_pred, sent_id, reranking_set, sample_num, model_file_prefix);
+    y_preds.push_back(y_pred);
+    string output_s = "";
+    for(int j = 0; j < y_pred.size(); j++){
+      output_s += (td.Convert(y_pred[j]) + " ");
+    }
+    boost::algorithm::trim(output_s);
+    cout << output_s << endl;
+    y_golds.push_back(sent.second);
+  }
+  evaluate(y_preds, y_golds, d, td);
+}
+
+void sample_only(ModelOne<LSTMBuilder>& modelone,
+          vector<pair<vector<int>,vector<int>>>&test_set,
+          unsigned int sample_num){
+  for (auto& sent : test_set) {
+    for (unsigned int si = 0; si < sample_num; ++si){
+      vector<int> y_pred;
+      modelone.Sample(sent.first, y_pred);
+      unsigned int i;
+      for(i = 0; i < y_pred.size()-1; ++i){
+        auto pred = modelone.td.Convert(y_pred[i]);
+        cout << pred << " ";
+      }
+      auto pred = modelone.td.Convert(y_pred[i]);
+      cout << pred;
+      cout << endl;
+    }
+  }
+}
+
+
+void read_file(string file_path,
+                     cnn::Dict& d,
+                     cnn::Dict& td,
+                     vector<pair<vector<int>,vector<int>>>&read_set)
+{
+  read_set.clear();
+  string line;
+  cerr << "Reading data from " << file_path << "...\n";
+  {
+    ifstream in(file_path);
+    assert(in);
+    while(getline(in, line)) {
+      read_set.push_back(ParseTrainingInstance(line, d, td));
+    }
+  }
+  cerr << "Reading data from " << file_path << " finished \n";
+}
+
+void save_models(string model_file_prefix,
+                    cnn::Dict& d,
+                    cnn::Dict& td,
+                    Model& model){
+  cerr << "saving models..." << endl;
+
+  const string f_name = model_file_prefix + ".params";
+  ofstream out(f_name);
+  boost::archive::text_oarchive oa(out);
+  oa << model;
+  out.close();
+
+  const string f_d_name = model_file_prefix + ".dict";
+  ofstream out_d(f_d_name);
+  boost::archive::text_oarchive oa_d(out_d);
+  oa_d << d;
+  out_d.close();
+
+  const string f_td_name = model_file_prefix + ".tdict";
+  ofstream out_td(f_td_name);
+  boost::archive::text_oarchive oa_td(out_td);
+  oa_td << td;
+  out_td.close();
+  cerr << "saving models finished" << endl;
+}
+
+void load_models(string model_file_prefix,
+                 Model& model){
+  cerr << "loading models..." << endl;
+
+  string fname = model_file_prefix + ".params";
+  ifstream in(fname);
+  boost::archive::text_iarchive ia(in);
+  ia >> model;
+  in.close();
+
+  cerr << "loading models finished" << endl;
+}
+
+void load_dicts(string model_file_prefix,
+                 cnn::Dict& d,
+                 cnn::Dict& td)
+{
+  cerr << "loading dicts..." << endl;
+  string f_d_name = model_file_prefix + ".dict";
+  ifstream in_d(f_d_name);
+  boost::archive::text_iarchive ia_d(in_d);
+  ia_d >> d;
+  in_d.close();
+
+  string f_td_name = model_file_prefix + ".tdict";
+  ifstream in_td(f_td_name);
+  boost::archive::text_iarchive ia_td(in_td);
+  ia_td >> td;
+  in_td.close();
+  cerr << "loading dicts finished" << endl;
+}
+
+
 
 
 int main(int argc, char** argv) {
@@ -847,6 +1086,8 @@ int main(int argc, char** argv) {
       ("pm_tag_hidden_dim", po::value<unsigned>(&TAG_HIDDEN_DIM)->default_value(256), "tag hidden dim")
       ("ner", po::bool_switch(&ner_tagging)->default_value(false), "the ner mode")
       ("bias_mode", po::value<int>(&bias_mode)->default_value(0), "bias the model in some interesting ways, 0 means no bias, 1 means bias to the left, 2 means bias to the right, 3 means only use observation to predict")
+      ("self_normalize_alpha", po::value<float>()->default_value(0), "self normalize alpha")
+      ("compute_normalize_z", po::bool_switch(&ner_tagging)->default_value(false), "compute normalize z")
   ;
 
   po::variables_map vm;
@@ -854,20 +1095,17 @@ int main(int argc, char** argv) {
   po::notify(vm);
 
   if (vm.count("help")) {
-      logfile << desc << "\n";
+      cerr << desc << "\n";
       return 1;
   }
-
-  logfile.open(vm["model_file_prefix"].as<string>() + ".log", ios::out);
-
   if(vm["train"].as<bool>()){
     if (vm.count("upe")){
-      logfile << "using pre-trained embeding from " << vm["upe"].as<string>() << endl;
+      cerr << "using pre-trained embeding from " << vm["upe"].as<string>() << endl;
       use_pretrained_embeding = true;
       pretrained_embeding = vm["upe"].as<string>();
     }else{
       use_pretrained_embeding = false;
-      logfile << "not using pre-trained embeding" << endl;
+      cerr << "not using pre-trained embeding" << endl;
     }
 
     bool use_dropout = false;
@@ -876,7 +1114,7 @@ int main(int argc, char** argv) {
       dropout_rate = vm["dropout_rate"].as<float>();
       use_dropout = (dropout_rate > 0);
       if(use_dropout){
-        logfile << "using dropout training, dropout rate: " << dropout_rate << endl;
+        cerr << "using dropout training, dropout rate: " << dropout_rate << endl;
       }
     }else{
       use_dropout = false;
@@ -906,8 +1144,9 @@ int main(int argc, char** argv) {
     float eta_decay_rate = vm["eta_decay_rate"].as<float>();
     unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<unsigned>();
 
-    logfile << "eta_decay_rate: " << eta_decay_rate << endl;
-    logfile << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;
+    cerr << "eta_decay_rate: " << eta_decay_rate << endl;
+    cerr << "eta_decay_onset_epoch: " << eta_decay_onset_epoch << endl;
+    cerr << "self_normalize_alpha: " << vm["self_normalize_alpha"].as<float>() << endl; 
 
     Model model;
     // auto sgd = new SimpleSGDTrainer(&model);
@@ -943,7 +1182,7 @@ int main(int argc, char** argv) {
           completed_epoch++;
           if (eta_decay_onset_epoch && completed_epoch >= (int)eta_decay_onset_epoch)
             sgd->eta *= eta_decay_rate;
-          logfile << "**SHUFFLE\n" << endl;
+          cerr << "**SHUFFLE\n" << endl;
           shuffle(order.begin(), order.end(), *rndeng);
         }
 
@@ -953,7 +1192,8 @@ int main(int argc, char** argv) {
         ++si;
         vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
         vector<int> y_pred;
-        modelone.ComputeLoss(xins, sent.second, y_pred, cg, use_dropout, dropout_rate);
+
+        modelone.ComputeLoss(xins, sent.second, y_pred, cg, use_dropout, dropout_rate, true, vm["self_normalize_alpha"].as<float>());
         ttags += sent.second.size();
         loss += as_scalar(cg.forward());
         cg.backward();
@@ -961,10 +1201,21 @@ int main(int argc, char** argv) {
         ++lines;
       }
       sgd->status();
-      logfile << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") " << endl;
+      cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") " << endl;
       report++;
       if (report % dev_every_i_reports == 0) {
         double f = predict_and_evaluate(modelone, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
+        // if(true){
+        //   float total_len = 0;
+        //   float total_z = 0;
+        //   for(auto sent : dev){
+        //     ComputationGraph cg;
+        //     vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
+        //     total_z += modelone.ComputeZ(xins, sent.second, cg);
+        //     total_len += (sent.first.size() + 1);
+        //   }
+        //   cerr << "normalize_z: " <<  (total_z/total_len) << endl;
+        // }
         if (f > f_best) {
           f_best = f;
           save_models(vm["model_file_prefix"].as<string>(), d, td, model);
@@ -984,15 +1235,71 @@ int main(int argc, char** argv) {
     ModelOne<LSTMBuilder> modelone(model, d, td);
     load_models(vm["model_file_prefix"].as<string>(), model);
     vector<pair<vector<int>,vector<int>>> test;
-    read_file(vm["test_file"].as<string>(), d, td, test, true);
+    read_file(vm["test_file"].as<string>(), d, td, test);
 
     if(vm["test"].as<bool>()){
-      test_only(modelone, test);
+      vector<vector<int>> test_reranking;
+      read_reranking_file(vm["test_file"].as<string>() + ".reranking", d, td, test_reranking);
+      test_and_evaluate(modelone, test, test_reranking, vm["sample_num"].as<unsigned int>(), d, td, vm["model_file_prefix"].as<string>());
     }else if(vm["sample"].as<bool>()){
-      sample_only(modelone, test, vm["sample_num"].as<unsigned int>());
+      // sample_only(modelone, test, vm["sample_num"].as<unsigned int>());
+      unsigned int sample_num = vm["sample_num"].as<unsigned int>();
+      vector<vector<int>> best_score_set;
+      vector<vector<int>> oracle_set;
+      vector<vector<int>> y_golds;
+      cerr << "start sampling" << endl;
+      int sent_id = 0;
+      for(auto sent : test){
+        cerr << "sample " << sent_id++ << endl;
+        vector<vector<int>> y_samples(sample_num);
+        vector<float> y_scores;
+        modelone.SampleParallel(sent.first, y_samples, y_scores, sample_num, vm["model_file_prefix"].as<string>(), annel_value, false, 0);
+        int best_oracle = 0;
+        unsigned int best_oracle_ind = 0;
+        float best_score = 9e99;
+        unsigned int best_score_ind = 0;
+        auto y_gold = sent.second;
+        y_golds.push_back(y_gold);
+        for(int i = 0; i < y_samples.size(); i++){
+          auto y_sample = y_samples[i];
+          assert(y_sample.size() == y_gold.size());
+          int oracle_correct = 0;
+          string output_s = "";
+          for(int j = 0; j < y_sample.size(); j++){
+            if(y_sample[j] == y_gold[j]) oracle_correct++;
+            output_s += (td.Convert(y_sample[j]) + " ");
+          }
+          boost::algorithm::trim(output_s);
+          cout << output_s << endl;
+          if(oracle_correct > best_oracle){
+            best_oracle = oracle_correct;
+            best_oracle_ind = i;
+          }
+          if(y_scores[i] < best_score){
+            best_score = y_scores[i];
+            best_score_ind = i;
+          }
+        }
+        best_score_set.push_back(y_samples[best_score_ind]);
+        oracle_set.push_back(y_samples[best_oracle_ind]);
+      }
+      cerr << "decoding score: " << endl;
+      evaluate(best_score_set, y_golds, d, td);
+      cerr << "oracle score: " << endl;
+      evaluate(oracle_set, y_golds, d, td);
+      cerr << "evaluation end" << endl;
+    }else if(vm["compute_normalize_z"].as<bool>()){
+      float total_len = 0;
+      float total_z = 0;
+      for(auto sent : test){
+        ComputationGraph cg;
+        vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
+        total_z += modelone.ComputeZ(xins, sent.second, cg);
+        total_len += (sent.first.size() + 1);
+      }
+      cerr << "normalize_z: " <<  (total_z/total_len) << endl;
     }
   }
-  logfile.close();
 }
 
 
