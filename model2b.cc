@@ -39,7 +39,8 @@ unsigned CLASS_HIDDEN_DIM = 128;
 bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
-ClassFactoredSoftmaxBuilder* cfsm = nullptr;
+
+float tau = 0;
 
 int SampleFromDist(vector<float> dist){
   unsigned w = 0;
@@ -96,8 +97,8 @@ struct ModelTwo {
   Parameters* p_thbias;
   Parameters* p_yth;
 
-  // Parameters* p_tbias;
-  // Parameters* p_th2t;
+  Parameters* p_tbias;
+  Parameters* p_th2t;
 
   cnn::Dict d;
   cnn::Dict td;
@@ -111,8 +112,8 @@ struct ModelTwo {
     p_R = model.add_parameters({td.size(), TAG_RNN_HIDDEN_DIM});
     p_thbias = model.add_parameters({WORD_HIDDEN_DIM});
     p_yth = model.add_parameters({WORD_HIDDEN_DIM, TAG_RNN_HIDDEN_DIM});
-    // p_tbias = model.add_parameters({d.size()});
-    // p_th2t = model.add_parameters({d.size(), WORD_HIDDEN_DIM});
+    p_tbias = model.add_parameters({d.size()});
+    p_th2t = model.add_parameters({d.size(), WORD_HIDDEN_DIM});
 
   }
 
@@ -121,7 +122,8 @@ struct ModelTwo {
                          const vector<int>& y,
                             ComputationGraph& cg,
                             bool use_dropout,
-                            float dropout_rate = 0) {
+                            float dropout_rate = 0,
+                            bool training = false) {
     int len = x.size();
     assert(x.size() == y.size());
 
@@ -129,10 +131,8 @@ struct ModelTwo {
     Expression i_R = parameter(cg , p_R);
     Expression i_thbias = parameter(cg , p_thbias);
     Expression i_yth = parameter(cg , p_yth);
-    // Expression i_tbias = parameter(cg , p_tbias);
-    // Expression i_th2t = parameter(cg , p_th2t);
-
-    cfsm->new_graph(cg);
+    Expression i_tbias = parameter(cg , p_tbias);
+    Expression i_th2t = parameter(cg , p_th2t);
 
     vector<Expression> errs;
     // First we have an rnn generates y
@@ -164,75 +164,23 @@ struct ModelTwo {
       Expression y_t = ye->embed(y[t]);
       Expression i_th = tanh(affine_transform({i_thbias, i_yth, y_t}));
       
-      // Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
-      // Expression i_err = pickneglogsoftmax(i_t, x[t]);
+      Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+      Expression i_err = pickneglogsoftmax(i_t, x[t]);
 
-      Expression i_err = cfsm->neg_log_softmax(i_th, x[t]);
-      errs.push_back(i_err);
+      Expression t_err;
+
+      if (tau == 0 || training == false){
+        t_err = i_err;
+      }else{
+        Expression tau_e = input(cg, tau);
+        Expression e_p = softmax(i_t);
+        Expression e_logp = log(e_p);
+        Expression ent = transpose(e_p) * e_logp;
+        t_err = i_err - tau_e * ent;
+      }
+      errs.push_back(t_err);
     }
     return sum(errs);
-  }
-
-  void RandomSample(int max_len = 150){
-    cerr << endl;
-
-    vector<int> gen_y;
-    vector<int> gen_x;
-
-    ComputationGraph cg;
-    Expression i_bias = parameter(cg , p_bias);
-    Expression i_R = parameter(cg , p_R);
-    Expression i_thbias = parameter(cg , p_thbias);
-    Expression i_yth = parameter(cg , p_yth);
-    // Expression i_tbias = parameter(cg , p_tbias);
-    // Expression i_th2t = parameter(cg , p_th2t);
-    cfsm->new_graph(cg);
-    tagrnn.new_graph(cg);
-    tagrnn.start_new_sequence();
-    ye->new_graph(cg);
-    int len = 0;
-    int cur = TAGSOS;
-    while(len < max_len) {
-      ++len;
-      tagrnn.add_input(ye->embed(cur));
-      Expression h_t = tagrnn.back();
-      Expression u_t = affine_transform({i_bias, i_R, h_t});
-      // NOTE HERE: THERE IS NO NON-LINEAR TRANSFORMATION AT THIS STEP?
-      Expression ydist = softmax(u_t);
-
-      unsigned w = 0;
-      auto dist = as_vector(cg.get_value(ydist.i));
-      do {
-       w = SampleFromDist(dist);
-      } while((int) w == TAGSOS);
-
-      cur = w;
-      if(cur == TAGEOS) break;
-      gen_y.push_back(cur);
-      // cerr << (len == 1 ? "" : " ") << d.Convert(cur);
-      ++len;
-    }
-
-    for(unsigned int t = 0; t < gen_y.size(); ++t){
-      Expression y_t = ye->embed(gen_y[t]);
-      Expression i_th = tanh(affine_transform({i_thbias, i_yth, y_t}));
-      // Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
-
-      // Expression xdist = softmax(i_t);
-      // auto dist = as_vector(cg.get_value(xdist.i));
-      unsigned w = 0;
-      do {
-        w = cfsm->sample(i_th);
-      } while((int) w == TOKENSOS || (int) w == TOKENEOS);
-      gen_x.push_back(w);
-    }
-
-    cerr << "Sample: " << endl;
-    assert(gen_x.size() == gen_y.size());
-    for(unsigned i = 0; i < gen_y.size(); ++i){
-      cerr << ((i == 0) ? "" : " ") << d.Convert(gen_x[i]) << "/" << td.Convert(gen_y[i]);
-    }
-    cerr << endl;
   }
 };
 
@@ -564,7 +512,6 @@ int main(int argc, char** argv) {
   desc.add_options()
       ("help", "produce help message")
       ("train", po::bool_switch()->default_value(false), "the training mode")
-      ("clusters", po::value<string>(), "path to the word clusters")
       ("load_original_model", po::bool_switch()->default_value(false), "continuing the training by loading the model, only valid during training")
       ("test", po::bool_switch()->default_value(false), "the test mode")
       ("dev_every_i_reports", po::value<unsigned>(&dev_every_i_reports)->default_value(1000))
@@ -580,6 +527,7 @@ int main(int argc, char** argv) {
       ("eta_decay_rate", po::value<float>()->default_value(0.5f), "how much to decay eta by (recommended 0.5)")
       ("dropout_rate", po::value<float>(), "dropout rate, also indicts using dropout during training")
       ("ner", po::bool_switch(&ner_tagging)->default_value(false), "the ner mode")
+      ("max_ent_reg", po::value<float>(&tau)->default_value(0), "the tau")
   ;
 
   po::variables_map vm;
@@ -625,7 +573,6 @@ int main(int argc, char** argv) {
     assert(tgSOS == 0 && tgEOS == 1);
 
     Model model;
-    cfsm = new ClassFactoredSoftmaxBuilder(CLASS_HIDDEN_DIM, vm["clusters"].as<string>(), &d, &model);
     vector<pair<vector<int>,vector<int>>> training, dev, test;
     vector<vector<int>> dev_reranking, test_reranking;
     read_file(vm["train_file"].as<string>(), d, td, training);
@@ -689,7 +636,7 @@ int main(int argc, char** argv) {
         ComputationGraph cg;
         auto& sent = training[order[si]];
         ++si;
-        modeltwo.ComputeLoss(sent.first, sent.second, cg, use_dropout, dropout_rate);
+        modeltwo.ComputeLoss(sent.first, sent.second, cg, use_dropout, dropout_rate, true);
         ttags += sent.second.size();
         loss += as_scalar(cg.forward());
         cg.backward();
@@ -718,7 +665,6 @@ int main(int argc, char** argv) {
     cnn::Dict d;
     cnn::Dict td;
     load_dicts(vm["model_file_prefix"].as<string>(), d, td);
-    cfsm = new ClassFactoredSoftmaxBuilder(CLASS_HIDDEN_DIM, vm["clusters"].as<string>(), &d, &model);
     ModelTwo<LSTMBuilder> modeltwo(model, d, td);
     load_models(vm["model_file_prefix"].as<string>(), model);
     vector<pair<vector<int>,vector<int>>> test;

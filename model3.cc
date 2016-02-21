@@ -98,6 +98,18 @@ bool unique_insert(vector<vector<int>>& big, vector<int> small){
   return true;
 }
 
+bool all_equal(vector<int> v1, vector<int> v2){
+   bool ae = true;
+   assert(v1.size()== v2.size());
+    for(unsigned int i = 0; i < v1.size(); i++){
+      if(v1[i] != v2[i]){
+        ae = false;
+        break;
+      }
+    }
+    return ae;
+}
+
 bool extract_tag(int tag, cnn::Dict& td, pair<string, string>& res){
   if (tag == td.Convert("O") || tag == TAGSOS || tag == TAGEOS) return true;
   vector<string> fields;
@@ -318,7 +330,6 @@ struct ModelThree {
                             ComputationGraph& cg,
                             vector<vector<int>>& y_samples,
                             vector<float>& y_samples_neglogprob_in_q,
-                            float alpha_value,
                             bool use_dropout,
                             float dropout_rate = 0) {
     assert (y_samples.size() == y_samples_neglogprob_in_q.size());
@@ -341,11 +352,11 @@ struct ModelThree {
     }
     ye->new_graph(cg);
     
-    Expression sample_num_inv = input(cg, (1.0f / ((float)y_samples.size()) ) ) ;
 
     // cerr << "y_samples size: " << y_samples.size() << endl;
 
     vector<Expression> zx_elements;
+    vector<Expression> xy_elements;
     for (unsigned int ind = 0; ind < y_samples.size(); ind++){
       auto sample = y_samples[ind];
       vector<Expression> szx;
@@ -366,28 +377,16 @@ struct ModelThree {
       Expression temp_factor = sum(szx) + input(cg, y_samples_neglogprob_in_q[ind]);
       // cerr << "here: " << as_scalar(cg.get_value(temp_factor.i)) << endl;
       zx_elements.push_back(temp_factor);
+      if (all_equal(sample, y)){
+        xy_elements.push_back(temp_factor);
+      }
     }
     // approximate the zx
-    Expression zx = log(sample_num_inv) + logsumexp(zx_elements);
-    Expression score_xy;
-    {
-      vector<Expression> szx;
-      tagrnn.start_new_sequence();
-      tagrnn.add_input(ye->embed(TAGSOS));
-      for(unsigned int t = 0; t < len+1; ++t){
-        Expression h_rnn_last = tagrnn.back();
-        // the factor -- c from the bi-rnn at this time step
-        Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
-        Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
-        if(t < len){
-          tagrnn.add_input(ye->embed(y[t]));
-        }
-        Expression factor_score =  pick(i_t, t < len ? y[t] : TAGEOS);
-        szx.push_back(factor_score);
-      }
-      score_xy = sum(szx);
-    }
-    return (- score_xy + zx);
+    Expression zx = logsumexp(zx_elements);
+    assert(xy_elements.size() > 0);
+    Expression xy = logsumexp(xy_elements);
+    return (zx - xy);
+
   }
 
     // return Expression of total loss
@@ -590,15 +589,20 @@ void SampleParallelMEMM(const vector<int> x,
           Expression h_rnn_last = tagrnn.back();
           // the factor -- c from the bi-rnn at this time step
           Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
-          Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * annel;
+          Expression i_t = affine_transform({i_tbias, i_th2t, i_th});
+          Expression i_t_annel = affine_transform({i_tbias, i_th2t, i_th}) * annel;
           unsigned sample_i = 0;
           Expression res = softmax(i_t);
           vector<float> dist = as_vector(cg.get_value(res.i));
+
+          Expression res_annel = softmax(i_t_annel);
+          vector<float> dist_annel = as_vector(cg.get_value(res_annel.i));
+
           bool resample;
           if(t < len){
             do {
               resample = false;
-              sample_i = SampleFromDist(dist);
+              sample_i = SampleFromDist(dist_annel);
               if(ner_tagging){
                 pair<string, string> res;
                 extract_tag(sample_i, td, res);
@@ -770,7 +774,8 @@ void SampleParallelMEMM(const vector<int> x,
 
 
 
-pair<vector<int>,vector<int>> ParseTrainingInstance(const std::string& line, cnn::Dict& d, cnn::Dict& td, bool test_only = false) {
+pair<vector<int>,vector<int>> ParseTrainingInstance(const std::string& line, cnn::Dict& d, cnn::Dict& td) {
+  bool test_only = false;
   std::istringstream in(line);
   std::string word;
   std::string sep = "|||";
@@ -976,8 +981,7 @@ void sample_only(ModelThree<LSTMBuilder>& modelthree,
 void read_file(string file_path,
                      cnn::Dict& d,
                      cnn::Dict& td,
-                     vector<pair<vector<int>,vector<int>>>&read_set,
-                     bool test_only = false)
+                     vector<pair<vector<int>,vector<int>>>&read_set)
 {
   read_set.clear();
   string line;
@@ -986,7 +990,7 @@ void read_file(string file_path,
     ifstream in(file_path);
     assert(in);
     while(getline(in, line)) {
-      read_set.push_back(ParseTrainingInstance(line, d, td, test_only));
+      read_set.push_back(ParseTrainingInstance(line, d, td));
     }
   }
   cerr << "Reading data from " << file_path << " finished \n";
@@ -1140,7 +1144,7 @@ int main(int argc, char** argv) {
   desc.add_options()
       ("help", "produce help message")
       ("train", po::bool_switch()->default_value(false), "the training mode")
-      ("load_original_model", po::bool_switch()->default_value(false), "continuing the training by loading the model, only valid during training")
+      ("load_original_model", po::value<string>(), "continuing the training by loading the model, only valid during training")
       ("load_pretrained_model", po::value<string>(), "continuing the training by loading the pretrained model, only valid during training")
       ("test", po::bool_switch()->default_value(false), "the test mode")
       ("sample", po::bool_switch()->default_value(false), "the sample mode -- for each sentence, generate sample_num samples")
@@ -1153,12 +1157,14 @@ int main(int argc, char** argv) {
       ("test_file", po::value<string>(), "path of the test file")
       ("model_file_prefix", po::value<string>(), "prefix path of the model files (and dictionaries)")
       ("upe", po::value<string>(), "use pre-trained word embeding")
-      ("eta0", po::value<float>()->default_value(0.1f), "initial learning rate")
+      ("eta0", po::value<float>()->default_value(0.05f), "initial learning rate")
       ("eta_decay_onset_epoch", po::value<unsigned>()->default_value(8), "start decaying eta every epoch after this epoch (try 8)")
       ("eta_decay_rate", po::value<float>()->default_value(0.5f), "how much to decay eta by (recommended 0.5)")
       ("dropout_rate", po::value<float>(), "dropout rate, also indicts using dropout during training")
       ("annel_value", po::value<float>(&annel_value)->default_value(1.0f), "annel value when sampling")
       ("ner", po::bool_switch(&ner_tagging)->default_value(false), "the ner mode")
+      ("reranking_file", po::value<string>(), "specify the reranking file")
+      ("start_iter", po::value<int>()->default_value(0), "the start training iteration")
   ;
 
   po::variables_map vm;
@@ -1230,16 +1236,18 @@ int main(int argc, char** argv) {
     Model qmodel;
     ModelThree<LSTMBuilder> modelone(qmodel, d, td);
 
-    if(vm["load_original_model"].as<bool>()){
-      cerr << "load_original_model" << endl;
-      cerr << "should not be here" << endl;
-      abort();
-      // the two models share the same starting point, but the one used for q will never change again
-      load_models(vm["model_file_prefix"].as<string>(), model);
-    }else if(vm.count("load_pretrained_model")){
+
+    if(vm.count("load_pretrained_model")){
       cerr << "load_pretrained_model" << endl;
+      load_models(vm["load_pretrained_model"].as<string>(), qmodel);   
+    }
+
+    if(vm.count("load_original_model")){
+      cerr << "load half trained model" << endl;
+      load_models(vm["load_original_model"].as<string>(), model);
+    }else{
+      // the two models share the same starting point, but the one used for q will never change again
       load_models(vm["load_pretrained_model"].as<string>(), model);
-      load_models(vm["load_pretrained_model"].as<string>(), qmodel);
     }
 
     double f_best = 0;
@@ -1249,7 +1257,8 @@ int main(int argc, char** argv) {
     vector<unsigned> order(training.size());
     for (unsigned i = 0; i < order.size(); ++i) order[i] = i;
     bool first = true;
-    int report = 0;
+    int report = vm["start_iter"].as<int>();
+    cerr << "string from " << report << endl;
     unsigned lines = 0;
     int completed_epoch = -1;
     while(1) {
@@ -1257,6 +1266,8 @@ int main(int argc, char** argv) {
       double loss = 0;
       unsigned ttags = 0;
       double correct = 0;
+      int unique_sample_counts = 0;
+      int sentence_len = 0;
       for (unsigned i = 0; i < report_every_i; ++i) {
         if (si == training.size()) {
           si = 0;
@@ -1304,28 +1315,32 @@ int main(int argc, char** argv) {
           // modelthree.SampleParallelMEMM(sent.first, y_samples_v, sample_num, 1.0f, use_dropout, dropout_rate);
           modelone.SampleParallelMEMM(sent.first, y_samples_v, y_scores, sample_num, vm["model_file_prefix"].as<string>(), annel_value, false, 0);
 
-          vector<vector<int>> y_samples;
-          vector<float> y_scores_unique;
-          for(unsigned int sample_ind = 0; sample_ind < sample_num; sample_ind++){
-            bool succ = unique_insert(y_samples, y_samples_v[sample_ind]);
-            if(succ){
-              y_scores_unique.push_back(y_scores[sample_ind]);
-            }
-          }
-          // keep the gold inside
+          vector<vector<int>> y_samples = y_samples_v;
+          vector<float> y_scores_unique = y_scores;
+          // for(unsigned int sample_ind = 0; sample_ind < sample_num; sample_ind++){
+          //   bool succ = unique_insert(y_samples, y_samples_v[sample_ind]);
+          //   if(succ){
+          //     y_scores_unique.push_back(y_scores[sample_ind]);
+          //   }
+          // }
+          // // keep the gold inside
           bool succ = unique_insert(y_samples, sent.second);
           if(succ){
+            cerr << "adding gold" << endl;
             ComputationGraph cg;
             vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
             vector<int> y_pred;
-            modelone.ComputeMEMMLoss(xins, sent.second, y_pred, cg, false, 0, 0);
+            modelone.ComputeMEMMLoss(xins, sent.second, y_pred, cg, false, 0, false, 0);
             y_scores_unique.push_back(as_scalar(cg.forward()));
           }
+
+          unique_sample_counts += y_samples.size();
+          sentence_len += sent.first.size();
 
           // build graph for this instance
           ComputationGraph cg;
           vector<Expression> xins = modelthree.ConstructInput(sent.first, cg);
-          modelthree.ComputeCRFLoss(xins, sent.second, cg, y_samples, y_scores_unique, vm["alpha"].as<float>(), use_dropout, dropout_rate);
+          modelthree.ComputeCRFLoss(xins, sent.second, cg, y_samples, y_scores_unique, false, 0);
           ttags += sent.second.size();
           loss += as_scalar(cg.forward());
           cg.backward();
@@ -1335,20 +1350,25 @@ int main(int argc, char** argv) {
         // }
       }
       sgd->status();
+      cerr << "Unique Sample Size (average per sentence): " << ((float)unique_sample_counts)/100.0f << endl;
+      cerr << "Sentence length (average per sentence): " << ((float)sentence_len)/100.0f  << endl;
 
       cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") " << endl;
       report++;
       if (report % dev_every_i_reports == 0) {
         // double f1 = predict_and_evaluate(modelone, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
         // cerr << "=== up f1 down f ===" << endl;
-        double f = predict_and_evaluate(modelthree, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
-        if (f > f_best) {
-          f_best = f;
-          save_models(vm["model_file_prefix"].as<string>(), d, td, model);
-        }
-        if (vm["evaluate_test"].as<bool>()){
-          predict_and_evaluate(modelthree, test, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value, "TEST");
-        }
+        
+        // double f = predict_and_evaluate(modelthree, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
+        // if (f > f_best) {
+        //   f_best = f;
+        //   save_models(vm["model_file_prefix"].as<string>(), d, td, model);
+        // }
+
+        save_models(vm["model_file_prefix"].as<string>() + "_" + to_string(report), d, td, model);
+        // if (vm["evaluate_test"].as<bool>()){
+        //   predict_and_evaluate(modelthree, test, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value, "TEST");
+        // }
       }
     }
     delete sgd;
@@ -1361,11 +1381,17 @@ int main(int argc, char** argv) {
     ModelThree<LSTMBuilder> modelthree(model, d, td);
     load_models(vm["model_file_prefix"].as<string>(), model);
     vector<pair<vector<int>,vector<int>>> test;
-    read_file(vm["test_file"].as<string>(), d, td, test, true);
+    read_file(vm["test_file"].as<string>(), d, td, test);
 
     if(vm["test"].as<bool>()){
       vector<vector<int>> test_reranking;
-      read_reranking_file(vm["test_file"].as<string>() + ".reranking", d, td, test_reranking);
+      string reranking_file_name;
+      if(vm.count("reranking_file")){
+        reranking_file_name = vm["reranking_file"].as<string>();
+      }else{
+        reranking_file_name = vm["test_file"].as<string>() + ".reranking";
+      }
+      read_reranking_file(reranking_file_name, d, td, test_reranking);
       test_and_evaluate(modelthree, test, test_reranking, vm["sample_num"].as<unsigned int>(), d, td, vm["model_file_prefix"].as<string>());
     }else if(vm["sample"].as<bool>()){
       sample_only(modelthree, test, vm["sample_num"].as<unsigned int>());

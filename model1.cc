@@ -63,6 +63,7 @@ bool use_pretrained_embeding = false;
 bool ner_tagging = false;
 string pretrained_embeding = "";
 int bias_mode = 0;
+bool greedy_decoding = false;
 
 int SampleFromDist(vector<float> dist){
   unsigned w = 0;
@@ -257,7 +258,8 @@ struct ModelOne {
                             bool use_dropout,
                             float dropout_rate = 0,
                             bool training_mode = true,
-                            float self_normalize_alpha_v = 0) {
+                            float self_normalize_alpha_v = 0,
+                            float tau_v = 0) {
     int len = xins.size();
     y_decode.clear();
 
@@ -282,7 +284,8 @@ struct ModelOne {
     ye->new_graph(cg);
 
     tagrnn.add_input(ye->embed(TAGSOS));
-    float total_nz = 0;
+
+    // float total_nz = 0;
     for(unsigned int t = 0; t < len+1; ++t){
       // first compute the y tag at this step
       // the factor -- last time h from forward tag rnn
@@ -302,17 +305,76 @@ struct ModelOne {
       }else{
         i_err = pickneglogsoftmax(i_t, t < len ? y[t] : TAGEOS);
       } 
-      errs.push_back(i_err);
+      Expression t_err;
+
+      if (tau_v == 0){
+        t_err = i_err;
+      }else{
+        Expression tau = input(cg, tau_v);
+        Expression e_p = softmax(i_t);
+        Expression e_logp = log(e_p);
+        Expression ent = transpose(e_p) * e_logp;
+        t_err = i_err - tau * ent;
+      }
+      errs.push_back(t_err);
+
+      
       // In this block, we decode the y tag at this step and put the corresponding y embedding on to tag rnn
       if(t < len){
+        set<int> skip_ind;
         vector<float> dist = as_vector(cg.get_value(i_t.i));
         double best = -9e99;
         int besti = -1;
-        for (int i = 0; i < dist.size(); ++i) {
-          if (dist[i] > best) { best = dist[i]; besti = i; }
-        }
+        bool resample = false;
+        do{
+          // either insert -1 or the tag last time
+          skip_ind.insert(besti);
+          best = -9e99;
+          besti = -1;
+          resample = false;
+          for (int i = 0; i < dist.size(); ++i) {
+            if(skip_ind.find(i) != skip_ind.end()){
+              // skip this index
+              continue;
+            }
+            if (dist[i] > best) { best = dist[i]; besti = i; }
+          }
+          if(ner_tagging){
+            pair<string, string> res;
+            extract_tag(besti, td, res);
+            if(t == 0){
+              if(res.first.compare("I") == 0 || res.first.compare("E") == 0){
+                resample = true;
+                continue;
+              }
+            }else if(t > 0){
+              if(res.first.compare("I") == 0){
+                int previous_tag = y_decode.back();
+                pair<string, string> prev;
+                extract_tag(previous_tag, td, prev);
+                if(previous_tag == besti || (prev.second.compare(res.second) == 0 && prev.first.compare("B") == 0) ){
+                  resample = false;
+                }else{
+                  resample = true;
+                  continue;
+                }
+              }else if(res.first.compare("E") == 0){
+                int previous_tag =  y_decode.back();
+                pair<string, string> prev;
+                extract_tag(previous_tag, td, prev);
+                if(prev.second.compare(res.second) == 0 && (prev.first.compare("I") == 0 || prev.first.compare("B") == 0)){
+                  resample = false;
+                }else{
+                  resample = true;
+                  continue;
+                }
+              }
+            }
+          }
+        } while(resample || (int) besti == TAGSOS || (int) besti == TAGEOS);
         // assert(besti != TAGSOS);
         y_decode.push_back(besti);
+
         // add to the tag rnn
         if(training_mode){
           // in the training mode, push the gold tag
@@ -321,6 +383,7 @@ struct ModelOne {
           // in the decoding mode, we can only push the predicted tag
           tagrnn.add_input(ye->embed(besti));
         }
+
       }
     }
     // cerr << "here:\t " << total_nz << endl;
@@ -511,14 +574,19 @@ struct ModelOne {
           // the factor -- c from the bi-rnn at this time step
           Expression i_th = tanh(affine_transform({i_thbias, i_cth, t < len ? c[t] : end_c, i_h_rnn_lastth, h_rnn_last}));
           Expression i_t = affine_transform({i_tbias, i_th2t, i_th}) * annel;
+          Expression i_t_annel = affine_transform({i_tbias, i_th2t, i_th}) * annel;
           unsigned sample_i = 0;
           Expression res = softmax(i_t);
           vector<float> dist = as_vector(cg.get_value(res.i));
+
+          Expression res_annel = softmax(i_t_annel);
+          vector<float> dist_annel = as_vector(cg.get_value(res_annel.i));
+
           bool resample;
           if(t < len){
             do {
               resample = false;
-              sample_i = SampleFromDist(dist);
+              sample_i = SampleFromDist(dist_annel);
               if(ner_tagging){
                 pair<string, string> res;
                 extract_tag(sample_i, td, res);
@@ -865,7 +933,7 @@ double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
     ComputationGraph cg;
     vector<int> y_pred;
     vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
-    modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, false);
+    modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, 0, false, 0);
     y_golds.push_back(sent.second);
     y_preds.push_back(y_pred);
   }
@@ -890,7 +958,7 @@ void test_only(ModelOne<LSTMBuilder>& modelone,
     ComputationGraph cg;
     vector<int> y_pred;
     vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
-    modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, false);
+    modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, 0, false, 0);
     unsigned int i;
     for(i = 0; i < y_pred.size()-1; ++i){
       auto pred = modelone.td.Convert(y_pred[i]);
@@ -933,26 +1001,47 @@ void test_and_evaluate(ModelOne<LSTMBuilder>& modelone,
                        cnn::Dict& d,
                        cnn::Dict& td,
                        string model_file_prefix){
-  cerr << "start testing" << endl;
-  assert(test_set.size() * sample_num == reranking_set.size());
-  vector<vector<int>> y_preds;
-  vector<vector<int>> y_golds;
-  for(int sent_id = 0; sent_id < test_set.size(); sent_id++){
-    cerr << "test sentence " << sent_id << endl;
-    auto sent = test_set[sent_id];
-    auto x = sent.first;
-    vector<int> y_pred;
-    modelone.rerank_parallel(x, y_pred, sent_id, reranking_set, sample_num, model_file_prefix);
-    y_preds.push_back(y_pred);
-    string output_s = "";
-    for(int j = 0; j < y_pred.size(); j++){
-      output_s += (td.Convert(y_pred[j]) + " ");
+
+  if(greedy_decoding){
+      vector<vector<int>> y_preds;
+      vector<vector<int>> y_golds;
+      for (auto& sent : test_set) {
+        ComputationGraph cg;
+        vector<int> y_pred;
+        vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
+        modelone.ComputeLoss(xins, sent.second, y_pred, cg, false, 0, false, 0);
+        y_golds.push_back(sent.second);
+        y_preds.push_back(y_pred);
+        string output_s = "";
+        for(int j = 0; j < y_pred.size(); j++){
+          output_s += (td.Convert(y_pred[j]) + " ");
+        }
+        boost::algorithm::trim(output_s);
+        cout << output_s << endl;
+      }
+      evaluate(y_preds, y_golds, d, td);
+  }else{
+    cerr << "start testing" << endl;
+    assert(test_set.size() * sample_num == reranking_set.size());
+    vector<vector<int>> y_preds;
+    vector<vector<int>> y_golds;
+    for(int sent_id = 0; sent_id < test_set.size(); sent_id++){
+      cerr << "test sentence " << sent_id << endl;
+      auto sent = test_set[sent_id];
+      auto x = sent.first;
+      vector<int> y_pred;
+      modelone.rerank_parallel(x, y_pred, sent_id, reranking_set, sample_num, model_file_prefix);
+      y_preds.push_back(y_pred);
+      string output_s = "";
+      for(int j = 0; j < y_pred.size(); j++){
+        output_s += (td.Convert(y_pred[j]) + " ");
+      }
+      boost::algorithm::trim(output_s);
+      cout << output_s << endl;
+      y_golds.push_back(sent.second);
     }
-    boost::algorithm::trim(output_s);
-    cout << output_s << endl;
-    y_golds.push_back(sent.second);
+    evaluate(y_preds, y_golds, d, td);
   }
-  evaluate(y_preds, y_golds, d, td);
 }
 
 void sample_only(ModelOne<LSTMBuilder>& modelone,
@@ -1088,6 +1177,9 @@ int main(int argc, char** argv) {
       ("bias_mode", po::value<int>(&bias_mode)->default_value(0), "bias the model in some interesting ways, 0 means no bias, 1 means bias to the left, 2 means bias to the right, 3 means only use observation to predict")
       ("self_normalize_alpha", po::value<float>()->default_value(0), "self normalize alpha")
       ("compute_normalize_z", po::bool_switch(&ner_tagging)->default_value(false), "compute normalize z")
+      ("greedy_decoding", po::bool_switch(&greedy_decoding)->default_value(false), "decoding using the greedy mode")
+      ("reranking_file", po::value<string>(), "specify the reranking file")
+      ("max_ent_reg", po::value<float>()->default_value(0), "the tau")
   ;
 
   po::variables_map vm;
@@ -1193,7 +1285,7 @@ int main(int argc, char** argv) {
         vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
         vector<int> y_pred;
 
-        modelone.ComputeLoss(xins, sent.second, y_pred, cg, use_dropout, dropout_rate, true, vm["self_normalize_alpha"].as<float>());
+        modelone.ComputeLoss(xins, sent.second, y_pred, cg, use_dropout, dropout_rate, true, vm["self_normalize_alpha"].as<float>(), vm["max_ent_reg"].as<float>());
         ttags += sent.second.size();
         loss += as_scalar(cg.forward());
         cg.backward();
@@ -1220,6 +1312,7 @@ int main(int argc, char** argv) {
           f_best = f;
           save_models(vm["model_file_prefix"].as<string>(), d, td, model);
         }
+        save_models(vm["model_file_prefix"].as<string>() + "_" + to_string(report), d, td, model);
         if (vm["evaluate_test"].as<bool>()){
           predict_and_evaluate(modelone, test, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value, "TEST");
         }
@@ -1239,7 +1332,13 @@ int main(int argc, char** argv) {
 
     if(vm["test"].as<bool>()){
       vector<vector<int>> test_reranking;
-      read_reranking_file(vm["test_file"].as<string>() + ".reranking", d, td, test_reranking);
+      string reranking_file_name;
+      if(vm.count("reranking_file")){
+        reranking_file_name = vm["reranking_file"].as<string>();
+      }else{
+        reranking_file_name = vm["test_file"].as<string>() + ".reranking";
+      }
+      read_reranking_file(reranking_file_name, d, td, test_reranking);
       test_and_evaluate(modelone, test, test_reranking, vm["sample_num"].as<unsigned int>(), d, td, vm["model_file_prefix"].as<string>());
     }else if(vm["sample"].as<bool>()){
       // sample_only(modelone, test, vm["sample_num"].as<unsigned int>());
