@@ -77,6 +77,18 @@ int SampleFromDist(vector<float> dist){
   return w;
 }
 
+bool all_equal(vector<int> v1, vector<int> v2){
+   bool ae = true;
+   assert(v1.size()== v2.size());
+    for(unsigned int i = 0; i < v1.size(); i++){
+      if(v1[i] != v2[i]){
+        ae = false;
+        break;
+      }
+    }
+    return ae;
+}
+
 bool extract_tag(int tag, cnn::Dict& td, pair<string, string>& res){
   if (tag == td.Convert("O") || tag == TAGSOS || tag == TAGEOS) return true;
   vector<string> fields;
@@ -257,7 +269,7 @@ struct ModelOne {
                             ComputationGraph& cg,
                             bool use_dropout,
                             float dropout_rate = 0,
-                            bool training_mode = true,
+                            bool training_mode = true, // with essentially means we are going to push the tags in y rather than make decisions on the fly
                             float self_normalize_alpha_v = 0,
                             float tau_v = 0) {
     int len = xins.size();
@@ -898,35 +910,17 @@ double evaluate_NER(vector<vector<int>>& y_preds,
   return f;
 }
 
+double evaluate(vector<vector<int>>& y_preds,
+                vector<vector<int>>& y_golds,
+                cnn::Dict& d,
+                cnn::Dict& td){
+  double f = ner_tagging ? evaluate_NER(y_preds, y_golds, d, td) : evaluate_POS(y_preds, y_golds, d, td);
+  return f;
+}
 
-double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
-                            const vector<pair<vector<int>,vector<int>>>&input_set,
-                            int sample_num,
-                            string model_file_prefix,
-                            float annel_value,
-                            string set_name = "DEV"
-                            ){
-  // vector<vector<int>> y_preds;
-  // vector<vector<int>> y_golds;
-  // for (auto& sent : input_set) {
-  //   vector<float> y_scores;
-  //   vector<vector<int>> y_samples(sample_num);
-  //   modelone.SampleParallel(sent.first, y_samples, y_scores, sample_num, model_file_prefix, annel_value, false, 0);
-  //   assert(y_samples.size() == y_scores.size());
-  //   float min_v = 9e99;
-  //   unsigned int min_i = 0;
-  //   for(unsigned int i = 0; i < y_scores.size(); ++i){
-  //     if(y_scores[i] < min_v){
-  //       min_v = y_scores[i];
-  //       min_i = i;
-  //     }
-  //   }
-  //   y_golds.push_back(sent.second);
-  //   y_preds.push_back(y_samples[min_i]);
-  // }
-  // double f = evaluate(y_preds, y_golds, modelone.d, modelone.td);
-  // cerr << set_name << endl;
-  // return f;
+double greedy_predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
+                                   const vector<pair<vector<int>,vector<int>>>&input_set,
+                                   string set_name = "DEV"){
   vector<vector<int>> y_preds;
   vector<vector<int>> y_golds;
   for (auto& sent : input_set) {
@@ -938,15 +932,68 @@ double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
     y_preds.push_back(y_pred);
   }
   double f = ner_tagging ? evaluate_NER(y_preds, y_golds, modelone.d, modelone.td) : evaluate_POS(y_preds, y_golds, modelone.d, modelone.td);
-  cerr << set_name << endl;
+  cerr << set_name << " " << "greedy"<< endl;
+  return f;
+
+}
+
+double rerank_predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
+                                   const vector<pair<vector<int>,vector<int>>>&input_set,
+                                   vector<vector<int>>& y_samples,
+                                   int sample_num,
+                                   string set_name = "DEV"){
+  vector<vector<int>> y_preds;
+  vector<vector<int>> y_golds;
+  for (unsigned sent_id = 0; sent_id < input_set.size(); ++sent_id) {
+    auto& sent = input_set[sent_id];
+    vector<float> y_scores;
+    set<vector<int>> scored_set;
+    for(unsigned ind = sent_id * sample_num; ind < (sent_id + 1) * sample_num; ++ind){
+        auto y_sample = y_samples[ind];
+        if(scored_set.find(y_sample) == scored_set.end()){
+          // never scored this before, do the scoring
+          ComputationGraph cg;
+          vector<int> y_pred;
+          vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
+          modelone.ComputeLoss(xins, y_sample, y_pred, cg, false, 0, true, 0, 0);
+          y_scores.push_back(as_scalar(cg.forward()));
+          scored_set.insert(y_sample);
+        }else{
+          // cerr << "skip scoring" << endl;
+          y_scores.push_back(9e99);
+        }
+    }
+    assert(sample_num == y_scores.size());
+    float min_v = 9e99;
+    unsigned int min_i = 0;
+    for(unsigned int i = 0; i < y_scores.size(); ++i){
+      if(y_scores[i] < min_v){
+        min_v = y_scores[i];
+        min_i = sent_id * sample_num + i;
+      }
+    }
+    y_golds.push_back(sent.second);
+    y_preds.push_back(y_samples[min_i]);
+  }
+  double f = evaluate(y_preds, y_golds, modelone.d, modelone.td);
+  cerr << set_name << " " << "rerank"<< endl;
   return f;
 }
 
-double evaluate(vector<vector<int>>& y_preds,
-                vector<vector<int>>& y_golds,
-                cnn::Dict& d,
-                cnn::Dict& td){
-  double f = ner_tagging ? evaluate_NER(y_preds, y_golds, d, td) : evaluate_POS(y_preds, y_golds, d, td);
+double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
+                            const vector<pair<vector<int>,vector<int>>>&input_set,
+                            bool score_rerank,
+                            vector<vector<int>>& y_samples,
+                            int sample_num,
+                            string set_name = "DEV"
+                            ){
+  double f;
+  double f_greedy = greedy_predict_and_evaluate(modelone, input_set, set_name);
+  f = f_greedy;
+  if (score_rerank){
+    double f_rerank = rerank_predict_and_evaluate(modelone, input_set, y_samples, sample_num, set_name);
+    f = f_rerank;
+  }
   return f;
 }
 
@@ -1157,6 +1204,7 @@ int main(int argc, char** argv) {
       ("sample_num", po::value<unsigned int>()->default_value(100), "the number of samples for each sentence")
       ("dev_every_i_reports", po::value<unsigned>(&dev_every_i_reports)->default_value(1000))
       ("evaluate_test", po::bool_switch()->default_value(false), "evaluate test set every training iteration")
+      ("evaluate_reranking", po::bool_switch()->default_value(true), "evaluate the reranking file")
       ("train_file", po::value<string>(), "path of the train file")
       ("dev_file", po::value<string>(), "path of the dev file")
       ("test_file", po::value<string>(), "path of the test file")
@@ -1232,6 +1280,16 @@ int main(int argc, char** argv) {
     if (vm["evaluate_test"].as<bool>()){
       read_file(vm["test_file"].as<string>(), d, td, test);
     }
+
+    vector<vector<int>> dev_reranking, test_reranking;
+    if (vm["evaluate_reranking"].as<bool>()){
+      string dev_reranking_file_name = vm["dev_file"].as<string>() + ".reranking";
+      read_reranking_file(dev_reranking_file_name, d, td, dev_reranking);
+      if (vm["evaluate_test"].as<bool>()){
+        string test_reranking_file_name = vm["test_file"].as<string>() + ".reranking";
+        read_reranking_file(test_reranking_file_name, d, td, test_reranking);
+      }
+    }
     
     float eta_decay_rate = vm["eta_decay_rate"].as<float>();
     unsigned eta_decay_onset_epoch = vm["eta_decay_onset_epoch"].as<unsigned>();
@@ -1295,26 +1353,23 @@ int main(int argc, char** argv) {
       sgd->status();
       cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") " << endl;
       report++;
+      // double predict_and_evaluate(ModelOne<LSTMBuilder>& modelone,
+      //                       const vector<pair<vector<int>,vector<int>>>&input_set,
+      //                       bool score_rerank,
+      //                       vector<vector<int>>& y_samples,
+      //                       int sample_num,
+      //                       string set_name = "DEV"
+      //                       )
+
       if (report % dev_every_i_reports == 0) {
-        double f = predict_and_evaluate(modelone, dev, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value);
-        // if(true){
-        //   float total_len = 0;
-        //   float total_z = 0;
-        //   for(auto sent : dev){
-        //     ComputationGraph cg;
-        //     vector<Expression> xins = modelone.ConstructInput(sent.first, cg);
-        //     total_z += modelone.ComputeZ(xins, sent.second, cg);
-        //     total_len += (sent.first.size() + 1);
-        //   }
-        //   cerr << "normalize_z: " <<  (total_z/total_len) << endl;
-        // }
+        double f = predict_and_evaluate(modelone, dev, vm["evaluate_reranking"].as<bool>(), dev_reranking, vm["sample_num"].as<unsigned int>());
         if (f > f_best) {
           f_best = f;
           save_models(vm["model_file_prefix"].as<string>(), d, td, model);
         }
         save_models(vm["model_file_prefix"].as<string>() + "_" + to_string(report), d, td, model);
         if (vm["evaluate_test"].as<bool>()){
-          predict_and_evaluate(modelone, test, vm["sample_num"].as<unsigned int>(), vm["model_file_prefix"].as<string>(), annel_value, "TEST");
+          double f = predict_and_evaluate(modelone, test, vm["evaluate_reranking"].as<bool>(), test_reranking, vm["sample_num"].as<unsigned int>(), "TEST");
         }
       }
     }

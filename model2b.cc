@@ -468,23 +468,24 @@ double predict_and_evaluate(ModelTwo<LSTMBuilder>& modeltwo,
                             unsigned int sample_num,
                             string set_name = "DEV"
                             ){
-  // for (int i = 0; i < 5; ++i){
-  //   modeltwo.RandomSample();
-  // }
   vector<vector<int>> y_preds;
   vector<vector<int>> y_golds;
   for (unsigned int i = 0; i < input_set.size(); ++i){
+    set<vector<int>> scored_set;
     auto sent = input_set[i];
     y_golds.push_back(sent.second);
     float min_loss = 9e99;
     unsigned int best_ind = i * sample_num;
     for (unsigned int j = i * sample_num; j < (i + 1) * sample_num; ++j){
-      ComputationGraph cg;
-      Expression loss = modeltwo.ComputeLoss(sent.first, reranking_set[j], cg, false);
-      float loss_d = as_scalar(cg.get_value(loss.i));
-      if (loss_d < min_loss){
-        min_loss = loss_d;
-        best_ind = j;
+      if(scored_set.find(reranking_set[j]) == scored_set.end()){
+        ComputationGraph cg;
+        Expression loss = modeltwo.ComputeLoss(sent.first, reranking_set[j], cg, false);
+        float loss_d = as_scalar(cg.get_value(loss.i));
+        if (loss_d < min_loss){
+          min_loss = loss_d;
+          best_ind = j;
+        }
+        scored_set.insert(reranking_set[j]);
       }
     }
     y_preds.push_back(reranking_set[best_ind]);
@@ -497,9 +498,7 @@ double predict_and_evaluate(ModelTwo<LSTMBuilder>& modeltwo,
     cout << output_s << endl;
   }
   double f = evaluate(y_preds, y_golds, modeltwo.d, modeltwo.td);
-
-
-  // cerr << set_name << endl;
+  cerr << set_name << endl;
   return f;
 }
 
@@ -647,14 +646,14 @@ int main(int argc, char** argv) {
       cerr << " E = " << (loss / ttags) << " ppl=" << exp(loss / ttags) << " (acc=" << (correct / ttags) << ") "  << endl;
       report++;
       if (report % dev_every_i_reports == 0) {
-        // double f = predict_and_evaluate(modeltwo, dev, dev_reranking, sample_num);
-        // if (f > f_best) {
-        //   f_best = f;
-        //   save_models(vm["model_file_prefix"].as<string>(), d, td, model);
-        //   if (vm["evaluate_test"].as<bool>()){
-        //     predict_and_evaluate(modeltwo, test, test_reranking, sample_num, "TEST");
-        //   }
-        // }
+        double f = predict_and_evaluate(modeltwo, dev, dev_reranking, sample_num);
+        if (f > f_best) {
+          f_best = f;
+          save_models(vm["model_file_prefix"].as<string>(), d, td, model);
+          if (vm["evaluate_test"].as<bool>()){
+            predict_and_evaluate(modeltwo, test, test_reranking, sample_num, "TEST");
+          }
+        }
         save_models(vm["model_file_prefix"].as<string>() + "_" + to_string(report), d, td, model);
       }
     }
